@@ -107,7 +107,12 @@ class SidebarButton(QPushButton):
 class CitySelector(QFrame):
     """Compact reusable location filter used by every market-aware page."""
 
-    def __init__(self, title: str, cities: tuple[str, ...] = CITIES) -> None:
+    def __init__(
+        self,
+        title: str,
+        cities: tuple[str, ...] = CITIES,
+        checked: bool = True,
+    ) -> None:
         super().__init__()
         self.setObjectName("filterPanel")
         layout = QVBoxLayout(self)
@@ -133,7 +138,7 @@ class CitySelector(QFrame):
         for city in cities:
             checkbox = QCheckBox(city)
             checkbox.setObjectName("cityChip")
-            checkbox.setChecked(True)
+            checkbox.setChecked(checked)
             chips.addWidget(checkbox, len(self.checkboxes) // 3, len(self.checkboxes) % 3)
             self.checkboxes.append(checkbox)
         layout.addLayout(chips)
@@ -259,20 +264,20 @@ class AlbionWindow(QMainWindow):
             "Áttekintés",
             "A három munkafolyamat kézzel összeállított kedvencei egy helyen.",
         )
-        summary = QGridLayout()
+        summary = QHBoxLayout()
         summary.setSpacing(14)
         self.dashboard_favorite_tables: dict[str, QTableWidget] = {}
-        for column, (context, title) in enumerate((
+        for context, title in (
             ("price", "Item-ár kedvencek"),
             ("crafting", "Crafting kedvencek"),
             ("flip", "Market flip kedvencek"),
-        )):
+        ):
             group = QGroupBox(title)
             group_layout = QVBoxLayout(group)
             table = self._table()
             self.dashboard_favorite_tables[context] = table
             group_layout.addWidget(table)
-            summary.addWidget(group, 0, column)
+            summary.addWidget(group, 1)
         layout.addLayout(summary, 1)
         layout.addStretch()
         return page
@@ -335,6 +340,11 @@ class AlbionWindow(QMainWindow):
         browser_layout.addLayout(controls)
         self.item_cities = CitySelector("Megjelenített városok")
         browser_layout.addWidget(self.item_cities)
+        self.item_flip_excluded = CitySelector(
+            "Flipből kizárt városok (nem kötelező)",
+            checked=False,
+        )
+        browser_layout.addWidget(self.item_flip_excluded)
         results_title = QLabel("Találatok")
         results_title.setObjectName("sectionTitle")
         browser_layout.addWidget(results_title)
@@ -1128,9 +1138,11 @@ class AlbionWindow(QMainWindow):
     def show_item_flips(self) -> None:
         if not self.selected_ids:
             return
-        cities = self.item_cities.selected_cities()
+        displayed_cities = self.item_cities.selected_cities()
+        excluded_cities = set(self.item_flip_excluded.selected_cities())
+        cities = [city for city in displayed_cities if city not in excluded_cities]
         if not cities:
-            self.statusBar().showMessage("Jelölj ki legalább egy várost.")
+            self.statusBar().showMessage("A kizárások után nem maradt vizsgálandó város.")
             return
         quality = self.item_quality.currentData()
         qualities = [quality] if quality else None
@@ -1144,6 +1156,11 @@ class AlbionWindow(QMainWindow):
                 cities=cities,
                 qualities=qualities,
                 limit=100,
+            )
+        if not opportunities:
+            self.statusBar().showMessage(
+                "A kizárt város nélkül nincs pozitív, friss flip ehhez az itemhez. "
+                "Próbáld meg frissíteni a piaci adatokat."
             )
         rows = [(
             row.source_city, row.destination_city, row.quality,
@@ -1247,6 +1264,11 @@ class AlbionWindow(QMainWindow):
                           COALESCE(i.name_en, rm.material_uniquename),
                           rm.amount,
                           MIN(CASE WHEN mp.sell_price_min > 0 THEN mp.sell_price_min END),
+                          (SELECT mp2.city FROM market_prices mp2
+                           WHERE mp2.item_uniquename = rm.material_uniquename
+                             AND mp2.city IN ({city_placeholders})
+                             AND mp2.sell_price_min > 0
+                           ORDER BY mp2.sell_price_min ASC LIMIT 1),
                           rm.returnable
                    FROM recipe_materials rm
                    LEFT JOIN items i ON i.uniquename = rm.material_uniquename
@@ -1256,7 +1278,7 @@ class AlbionWindow(QMainWindow):
                    WHERE rm.recipe_id = ?
                    GROUP BY rm.material_uniquename, i.name_en, rm.amount, rm.returnable
                    ORDER BY COALESCE(i.name_en, rm.material_uniquename)""",
-                (*cities, recipe_id),
+                (*cities, *cities, recipe_id),
             ).fetchall()
         source = self.craft_source.currentData()
         display_rows = [
@@ -1267,13 +1289,14 @@ class AlbionWindow(QMainWindow):
                 "Saját farmolás" if source == "farm" else (
                     f"{price:,}" if price is not None else "N/A"
                 ),
+                city or "N/A",
                 "Igen" if returnable else "Nem",
             )
-            for unique_name, name, amount, price, returnable in materials
+            for unique_name, name, amount, price, city, returnable in materials
         ]
         self.fill_table(
             self.craft_materials,
-            ["Alapanyag", "Uniquename", "Mennyiség", "Egységár", "Visszatérhet"],
+            ["Alapanyag", "Uniquename", "Mennyiség", "Egységár", "Legolcsóbb város", "Visszatérhet"],
             display_rows,
         )
 
