@@ -1,0 +1,15 @@
+FEJLESZTESI_TERV.md
+HASZNALATI_UTMUTATO.md
+items.json
+localization.json
+cf.py
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+data/*.db
+data/*.db-*
+app/ui/settings.json
+TECHNIKAI_ATTEKINTES.md
+SAJAT_OTLETEK.md
+tests
