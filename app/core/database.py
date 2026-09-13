@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 
-from app.services.market_api import DB_FILE
+from app.paths import CATALOG_DB_FILE, MARKET_DB_FILE, USER_DB_FILE
 
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
+
+
+class ManagedConnection(sqlite3.Connection):
+    """SQLite connection that also closes when used as a context manager."""
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 def _migration_001_market_history(conn: sqlite3.Connection) -> None:
@@ -148,6 +159,164 @@ MIGRATIONS: tuple[Migration, ...] = (
 )
 
 
+def _migration_004_market_identity(conn: sqlite3.Connection) -> None:
+    item_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'"
+    ).fetchone()
+    if item_table is None:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    if "market_id" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN market_id TEXT")
+    conn.execute("UPDATE items SET market_id = uniquename WHERE market_id IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_market_id ON items(market_id)")
+
+
+CATALOG_MIGRATIONS: tuple[Migration, ...] = (
+    (1, "recipe variants and returnable materials", _migration_002_recipe_variants),
+    (2, "item category hierarchy", _migration_003_item_category_tree),
+    (3, "separate market item identity", _migration_004_market_identity),
+)
+
+
+def _migration_001_market_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS market_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            item_uniquename TEXT NOT NULL,
+            city TEXT NOT NULL,
+            quality INTEGER NOT NULL,
+            enchantment INTEGER NOT NULL DEFAULT 0,
+            sell_price_min INTEGER,
+            sell_price_min_date TEXT,
+            sell_price_max INTEGER,
+            sell_price_max_date TEXT,
+            buy_price_min INTEGER,
+            buy_price_min_date TEXT,
+            buy_price_max INTEGER,
+            buy_price_max_date TEXT,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(item_id, city, quality, enchantment)
+        );
+        CREATE INDEX IF NOT EXISTS idx_market_item ON market_prices(item_id);
+        CREATE INDEX IF NOT EXISTS idx_market_lookup
+            ON market_prices(item_uniquename, enchantment, quality, city);
+        CREATE INDEX IF NOT EXISTS idx_market_sell ON market_prices(sell_price_min);
+        CREATE INDEX IF NOT EXISTS idx_market_buy ON market_prices(buy_price_max);
+        """
+    )
+    _migration_001_market_history(conn)
+
+
+MARKET_MIGRATIONS: tuple[Migration, ...] = (
+    (1, "market prices, history and sync audit", _migration_001_market_schema),
+)
+
+
+def _migration_002_stable_market_key(conn: sqlite3.Connection) -> None:
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(market_prices)")]
+    if not columns:
+        return
+    conn.executescript(
+        """
+        CREATE TABLE market_prices_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            item_uniquename TEXT NOT NULL,
+            city TEXT NOT NULL,
+            quality INTEGER NOT NULL,
+            enchantment INTEGER NOT NULL DEFAULT 0,
+            sell_price_min INTEGER, sell_price_min_date TEXT,
+            sell_price_max INTEGER, sell_price_max_date TEXT,
+            buy_price_min INTEGER, buy_price_min_date TEXT,
+            buy_price_max INTEGER, buy_price_max_date TEXT,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(item_uniquename, city, quality, enchantment)
+        );
+        INSERT OR REPLACE INTO market_prices_new
+        SELECT * FROM market_prices;
+        DROP TABLE market_prices;
+        ALTER TABLE market_prices_new RENAME TO market_prices;
+        CREATE INDEX idx_market_item ON market_prices(item_uniquename);
+        CREATE INDEX idx_market_lookup
+            ON market_prices(item_uniquename, enchantment, quality, city);
+        CREATE INDEX idx_market_sell ON market_prices(sell_price_min);
+        CREATE INDEX idx_market_buy ON market_prices(buy_price_max);
+        """
+    )
+
+
+MARKET_MIGRATIONS = MARKET_MIGRATIONS + (
+    (2, "stable cross-database item key", _migration_002_stable_market_key),
+)
+
+
+def _migration_001_user_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS favorites (
+            context TEXT NOT NULL CHECK(context IN ('price', 'crafting', 'flip')),
+            item_uniquename TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(context, item_uniquename)
+        );
+        CREATE INDEX IF NOT EXISTS idx_favorites_context
+            ON favorites(context, created_at);
+        CREATE TABLE IF NOT EXISTS user_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+USER_MIGRATIONS: tuple[Migration, ...] = (
+    (1, "favorites and user interface settings", _migration_001_user_schema),
+)
+
+
+def _apply_migration_set(
+    conn: sqlite3.Connection,
+    migrations: tuple[Migration, ...],
+    table_name: str,
+) -> list[int]:
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS {table_name} (
+               version INTEGER PRIMARY KEY,
+               description TEXT NOT NULL,
+               applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+           )"""
+    )
+    applied = {row[0] for row in conn.execute(f"SELECT version FROM {table_name}")}
+    completed: list[int] = []
+    for version, description, migration in migrations:
+        if version in applied:
+            continue
+        with conn:
+            migration(conn)
+            conn.execute(
+                f"INSERT INTO {table_name}(version, description) VALUES (?, ?)",
+                (version, description),
+            )
+        completed.append(version)
+    return completed
+
+
+def apply_catalog_migrations(conn: sqlite3.Connection) -> list[int]:
+    return _apply_migration_set(conn, CATALOG_MIGRATIONS, "catalog_schema_migrations")
+
+
+def apply_market_migrations(conn: sqlite3.Connection) -> list[int]:
+    return _apply_migration_set(conn, MARKET_MIGRATIONS, "market_schema_migrations")
+
+
+def apply_user_migrations(conn: sqlite3.Connection) -> list[int]:
+    return _apply_migration_set(conn, USER_MIGRATIONS, "user_schema_migrations")
+
+
 def apply_migrations(conn: sqlite3.Connection) -> list[int]:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -171,9 +340,33 @@ def apply_migrations(conn: sqlite3.Connection) -> list[int]:
     return completed
 
 
-def connect_database(path: str | Path = DB_FILE) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path))
+def connect_database(
+    path: str | Path = CATALOG_DB_FILE,
+    market_path: str | Path = MARKET_DB_FILE,
+    user_path: str | Path = USER_DB_FILE,
+) -> sqlite3.Connection:
+    """Open the catalogue and attach volatile market and private user stores."""
+
+    catalog = Path(path)
+    market = Path(market_path)
+    user = Path(user_path)
+    for db_path in (catalog, market, user):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with closing(sqlite3.connect(str(catalog))) as schema_conn:
+        with schema_conn:
+            schema_conn.execute("PRAGMA foreign_keys = ON")
+            apply_catalog_migrations(schema_conn)
+    with closing(sqlite3.connect(str(market))) as schema_conn:
+        with schema_conn:
+            apply_market_migrations(schema_conn)
+    with closing(sqlite3.connect(str(user))) as schema_conn:
+        with schema_conn:
+            apply_user_migrations(schema_conn)
+
+    conn = sqlite3.connect(str(catalog), factory=ManagedConnection)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
-    apply_migrations(conn)
+    conn.execute("ATTACH DATABASE ? AS market", (str(market),))
+    conn.execute("ATTACH DATABASE ? AS user", (str(user),))
     return conn

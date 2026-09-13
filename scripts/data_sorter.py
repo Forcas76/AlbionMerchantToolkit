@@ -7,12 +7,14 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from app.paths import DB_FILE as DATABASE_PATH
+from app.domain.item_identity import normalize_item_identity
+from app.paths import CATALOG_DB_FILE as DATABASE_PATH
 from app.services.item_catalog import sync_item_categories
 
 ITEMS_FILE = os.path.join(BASE_DIR, "items.json")
 LOCALIZATION_FILE = os.path.join(BASE_DIR, "localization.json")
 DB_FILE = str(DATABASE_PATH)
+BUILD_DB_FILE = DB_FILE + ".rebuild"
 
 # ── 1. Lokalizáció betöltése ─────────────────────────────────────────────────
 print("Localization betöltése...")
@@ -50,16 +52,17 @@ raw_items = items_data["items"]
 
 # ── 3. SQLite létrehozása ────────────────────────────────────────────────────
 os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-if os.path.exists(DB_FILE):
-    os.remove(DB_FILE)
+if os.path.exists(BUILD_DB_FILE):
+    os.remove(BUILD_DB_FILE)
 
-conn = sqlite3.connect(DB_FILE)
+conn = sqlite3.connect(BUILD_DB_FILE)
 cur  = conn.cursor()
 
 cur.executescript("""
     CREATE TABLE items (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         uniquename      TEXT NOT NULL UNIQUE,
+        market_id       TEXT NOT NULL,
         name_en         TEXT,
         item_type       TEXT,
         tier            INTEGER,
@@ -76,6 +79,7 @@ cur.executescript("""
         craftable       INTEGER DEFAULT 0
     );
     CREATE INDEX idx_items_uniquename ON items(uniquename);
+    CREATE INDEX idx_items_market_id  ON items(market_id);
     CREATE INDEX idx_items_type       ON items(item_type);
     CREATE INDEX idx_items_tier       ON items(tier);
     CREATE INDEX idx_items_category   ON items(shopcategory);
@@ -93,58 +97,6 @@ cur.executescript("""
     CREATE INDEX idx_item_categories_parent
         ON item_categories(parent_path, sort_order);
 
-    CREATE TABLE market_prices (
-        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_id             INTEGER NOT NULL REFERENCES items(id),
-        item_uniquename     TEXT NOT NULL,
-        city                TEXT NOT NULL,
-        quality             INTEGER NOT NULL,
-        enchantment         INTEGER NOT NULL DEFAULT 0,
-        sell_price_min      INTEGER,
-        sell_price_min_date TEXT,
-        sell_price_max      INTEGER,
-        sell_price_max_date TEXT,
-        buy_price_min       INTEGER,
-        buy_price_min_date  TEXT,
-        buy_price_max       INTEGER,
-        buy_price_max_date  TEXT,
-        fetched_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE (item_id, city, quality, enchantment)
-    );
-    CREATE INDEX idx_market_item ON market_prices(item_id);
-    CREATE INDEX idx_market_lookup
-        ON market_prices(item_uniquename, enchantment, quality, city);
-    CREATE INDEX idx_market_sell ON market_prices(sell_price_min);
-    CREATE INDEX idx_market_buy ON market_prices(buy_price_max);
-
-    CREATE VIEW best_purchase_prices AS
-    SELECT mp.*, i.name_en, i.tier, i.shopcategory
-    FROM market_prices mp
-    JOIN items i ON i.id = mp.item_id
-    WHERE mp.sell_price_min IS NOT NULL AND mp.sell_price_min > 0
-      AND NOT EXISTS (
-          SELECT 1 FROM market_prices cheaper
-          WHERE cheaper.item_id = mp.item_id
-            AND cheaper.quality = mp.quality
-            AND cheaper.enchantment = mp.enchantment
-            AND cheaper.sell_price_min IS NOT NULL
-            AND cheaper.sell_price_min > 0
-            AND cheaper.sell_price_min < mp.sell_price_min
-      );
-
-    CREATE VIEW best_sale_prices AS
-    SELECT mp.*, i.name_en, i.tier, i.shopcategory
-    FROM market_prices mp
-    JOIN items i ON i.id = mp.item_id
-    WHERE mp.buy_price_max IS NOT NULL AND mp.buy_price_max > 0
-      AND NOT EXISTS (
-          SELECT 1 FROM market_prices higher
-          WHERE higher.item_id = mp.item_id
-            AND higher.quality = mp.quality
-            AND higher.enchantment = mp.enchantment
-            AND higher.buy_price_max IS NOT NULL
-            AND higher.buy_price_max > mp.buy_price_max
-      );
 """)
 print("Adatbázis létrehozva.\n")
 
@@ -161,18 +113,25 @@ def safe_float(v, default=None):
 
 def insert_row(uniquename, item_type, enchantment, merged):
     """Egy sort ír az adatbázisba a merged attribútumokból."""
+    identity = normalize_item_identity(
+        uniquename,
+        merged.get("@enchantmentlevel", enchantment),
+        merged.get("@shopcategory"),
+        merged.get("@shopsubcategory1"),
+    )
     cur.execute("""
         INSERT OR IGNORE INTO items (
-            uniquename, name_en, item_type, tier, enchantment,
+            uniquename, market_id, name_en, item_type, tier, enchantment,
             shopcategory, shopsubcategory, shopsubcategory2, shopsubcategory3,
             slottype, weight, maxstacksize, itemvalue, uisprite, craftable
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         uniquename,
+        identity.market_id,
         get_en_name(uniquename) or None,
         item_type,
         safe_int(merged.get("@tier")),
-        enchantment,
+        identity.enchantment,
         merged.get("@shopcategory"),
         merged.get("@shopsubcategory1"),
         merged.get("@shopsubcategory2"),
@@ -196,7 +155,7 @@ def process_item(item, item_type):
     if not uniquename:
         return 0
 
-    count = insert_row(uniquename, item_type, enchantment=0, merged=item)
+    count = insert_row(uniquename, item_type, enchantment=None, merged=item)
 
     # Enchantment szintek keresése
     ench_block = item.get("enchantments", {})
@@ -283,4 +242,5 @@ for row in cur.fetchall():
     print(f"   {label}: {row[1]} db")
 
 conn.close()
+os.replace(BUILD_DB_FILE, DB_FILE)
 print(f"\nMentve: {DB_FILE}")

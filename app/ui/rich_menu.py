@@ -446,11 +446,11 @@ def show_selected_flips(item_ids: list[str], selected_name: str) -> None:
                             / buy.sell_price_min, 2)
                FROM market_prices buy
                JOIN market_prices sell
-                 ON sell.item_id = buy.item_id
+                 ON sell.item_uniquename = buy.item_uniquename
                 AND sell.quality = buy.quality
                 AND sell.enchantment = buy.enchantment
                 AND sell.city <> buy.city
-               JOIN items i ON i.id = buy.item_id
+               JOIN items i ON i.uniquename = buy.item_uniquename
                WHERE i.uniquename IN (""" + placeholders + """)
                  AND buy.sell_price_min > 0
                  AND sell.buy_price_max > buy.sell_price_min
@@ -502,7 +502,7 @@ def _market_rows(
         """SELECT i.name_en, mp.item_uniquename, mp.city, mp.quality,
                   mp.enchantment, mp.sell_price_min, mp.buy_price_max,
                   mp.fetched_at
-           FROM market_prices mp JOIN items i ON i.id = mp.item_id
+           FROM market_prices mp JOIN items i ON i.uniquename = mp.item_uniquename
            WHERE """
         + item_filter
         + " AND mp.enchantment IN (" + placeholders + """)
@@ -627,11 +627,11 @@ def show_item_flips() -> None:
                    sell.fetched_at
                FROM market_prices buy
                JOIN market_prices sell
-                 ON sell.item_id = buy.item_id
+                 ON sell.item_uniquename = buy.item_uniquename
                 AND sell.quality = buy.quality
                 AND sell.enchantment = buy.enchantment
                 AND sell.city <> buy.city
-               JOIN items i ON i.id = buy.item_id
+               JOIN items i ON i.uniquename = buy.item_uniquename
                WHERE buy.sell_price_min > 0
                  AND sell.buy_price_max > buy.sell_price_min
                  AND sell.buy_price_max > 0

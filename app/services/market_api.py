@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from app.paths import DB_FILE as DATABASE_PATH
+from app.paths import CATALOG_DB_FILE
 
 BASE_URL = "https://europe.albion-online-data.com/api/v2/stats/prices"
 MAX_URL_LEN = 4000
@@ -26,7 +26,7 @@ CITIES = (
     "Caerleon", "Bridgewatch", "Martlock", "Fort Sterling",
     "Thetford", "Lymhurst", "Brecilien", "Black Market",
 )
-DB_FILE = str(DATABASE_PATH)
+DB_FILE = str(CATALOG_DB_FILE)
 
 
 class ApiRateLimiter:
@@ -94,9 +94,11 @@ def chunk_ids(
 
 
 def fetch_item_ids(conn: sqlite3.Connection) -> list[str]:
-    """Return every unique item ID in the catalogue, including unnamed items."""
+    """Return the canonical IDs expected by the Albion Data Project."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    identity = "COALESCE(market_id, uniquename)" if "market_id" in columns else "uniquename"
     rows = conn.execute(
-        "SELECT uniquename FROM items ORDER BY uniquename"
+        f"SELECT DISTINCT {identity} FROM items ORDER BY {identity}"
     ).fetchall()
     return [row[0] for row in rows]
 
@@ -167,12 +169,13 @@ def save_prices(conn: sqlite3.Connection, prices: Iterable[dict[str, Any]]) -> i
         if not city or quality is None:
             continue
         item = conn.execute(
-            "SELECT id, uniquename FROM items WHERE uniquename = ?", (raw_id,)
+            "SELECT id, uniquename FROM items WHERE market_id = ?", (raw_id,)
         ).fetchone()
         if item is None:
             item = conn.execute(
-                "SELECT id, uniquename FROM items WHERE uniquename = ?",
-                (base_id,),
+                "SELECT id, uniquename FROM items "
+                "WHERE uniquename IN (?, ?) ORDER BY uniquename = ? DESC LIMIT 1",
+                (raw_id, base_id, raw_id),
             ).fetchone()
         if item is None:
             continue
@@ -195,7 +198,8 @@ def save_prices(conn: sqlite3.Connection, prices: Iterable[dict[str, Any]]) -> i
                 sell_price_max_date, buy_price_min, buy_price_min_date,
                 buy_price_max, buy_price_max_date, fetched_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(item_id, city, quality, enchantment) DO UPDATE SET
+            ON CONFLICT(item_uniquename, city, quality, enchantment) DO UPDATE SET
+                item_id=excluded.item_id,
                 item_uniquename=excluded.item_uniquename,
                 sell_price_min=excluded.sell_price_min,
                 sell_price_min_date=excluded.sell_price_min_date,
@@ -255,7 +259,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Import Albion market prices")
     parser.add_argument("--db", default=DB_FILE)
     args = parser.parse_args()
-    with sqlite3.connect(args.db) as conn:
+    from app.core.database import connect_database
+
+    with connect_database(args.db) as conn:
         print(f"Mentés: {do_fetch(conn)} piaci rekord")
 
 

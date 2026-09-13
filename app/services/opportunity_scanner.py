@@ -44,7 +44,7 @@ def load_quotes(
                    mp.buy_price_max, mp.buy_price_max_date,
                    COALESCE(i.weight, 0)
             FROM market_prices mp
-            JOIN items i ON i.id = mp.item_id
+            JOIN items i ON i.uniquename = mp.item_uniquename
             {where}
             ORDER BY mp.item_uniquename, mp.quality, mp.enchantment, mp.city""",
         parameters,

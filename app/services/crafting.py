@@ -6,10 +6,10 @@ import json
 import sqlite3
 from typing import Any
 
-from app.paths import DB_FILE as DATABASE_PATH, ITEMS_FILE as ITEM_CATALOG_PATH
+from app.paths import CATALOG_DB_FILE, ITEMS_FILE as ITEM_CATALOG_PATH
 
 ITEMS_FILE = str(ITEM_CATALOG_PATH)
-DB_FILE = str(DATABASE_PATH)
+DB_FILE = str(CATALOG_DB_FILE)
 
 
 def _as_int(value: Any, default: int = 0) -> int:

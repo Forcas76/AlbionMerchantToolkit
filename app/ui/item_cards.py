@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QVBoxLayout,
@@ -95,8 +96,15 @@ class ItemIconLoader(QNetworkAccessManager):
 
 class ItemCard(QFrame):
     selected = pyqtSignal(object)
+    favorite_requested = pyqtSignal(str)
 
-    def __init__(self, row: tuple, quality: int, icon_loader: ItemIconLoader) -> None:
+    def __init__(
+        self,
+        row: tuple,
+        quality: int,
+        icon_loader: ItemIconLoader,
+        favorite: bool = False,
+    ) -> None:
         super().__init__()
         self.row = row
         self.quality = quality
@@ -124,9 +132,20 @@ class ItemCard(QFrame):
 
         text = QVBoxLayout()
         text.setSpacing(4)
+        title_row = QHBoxLayout()
         title = QLabel(name or unique_name)
         title.setObjectName("itemCardTitle")
         title.setWordWrap(True)
+        self.favorite_button = QPushButton()
+        self.favorite_button.setObjectName("favoriteButton")
+        self.favorite_button.setFixedSize(30, 30)
+        self.favorite_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.favorite_button.clicked.connect(
+            lambda: self.favorite_requested.emit(unique_name)
+        )
+        self.set_favorite(favorite)
+        title_row.addWidget(title, 1)
+        title_row.addWidget(self.favorite_button)
         quality_label = f"Q{quality}" if quality else "Minden quality"
         badges = QLabel(
             f"T{tier}.{enchantment}   ·   {quality_label}   ·   {category or 'egyéb'}"
@@ -135,11 +154,20 @@ class ItemCard(QFrame):
         identifier = QLabel(unique_name)
         identifier.setObjectName("itemCardId")
         identifier.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        text.addWidget(title)
+        text.addLayout(title_row)
         text.addWidget(badges)
         text.addStretch()
         text.addWidget(identifier)
         root.addLayout(text, 1)
+
+    def set_favorite(self, favorite: bool) -> None:
+        self.favorite_button.setText("★" if favorite else "☆")
+        self.favorite_button.setToolTip(
+            "Eltávolítás a kedvencekből" if favorite else "Hozzáadás a kedvencekhez"
+        )
+        self.favorite_button.setProperty("favorite", favorite)
+        self.favorite_button.style().unpolish(self.favorite_button)
+        self.favorite_button.style().polish(self.favorite_button)
 
     def load_icon(self) -> None:
         if self.icon_requested:
@@ -193,6 +221,7 @@ class ItemCardGrid(QScrollArea):
     """Card result viewport that only requests icons close to the visible area."""
 
     item_selected = pyqtSignal(object)
+    favorite_requested = pyqtSignal(str)
 
     def __init__(self, icon_loader: ItemIconLoader) -> None:
         super().__init__()
@@ -222,6 +251,7 @@ class ItemCardGrid(QScrollArea):
         rows: list[tuple],
         quality: int,
         selected_id: str | None = None,
+        favorite_ids: set[str] | None = None,
     ) -> None:
         for card in self.cards:
             card.setParent(None)
@@ -231,8 +261,9 @@ class ItemCardGrid(QScrollArea):
         self.cards = []
         self.current_card = None
         for row in rows:
-            card = ItemCard(row, quality, self.icon_loader)
+            card = ItemCard(row, quality, self.icon_loader, row[0] in (favorite_ids or set()))
             card.selected.connect(lambda selected_row, source=card: self._select(source, selected_row))
+            card.favorite_requested.connect(self.favorite_requested)
             self.cards.append(card)
             if row[0] == selected_id:
                 self.current_card = card
@@ -240,6 +271,11 @@ class ItemCardGrid(QScrollArea):
         self._relayout()
         self.verticalScrollBar().setValue(0)
         self._schedule_lazy_load()
+
+    def set_favorite_state(self, item_id: str, enabled: bool) -> None:
+        for card in self.cards:
+            if card.row[0] == item_id:
+                card.set_favorite(enabled)
 
     def _select(self, card: ItemCard, row: tuple) -> None:
         if self.current_card is not None and self.current_card is not card:

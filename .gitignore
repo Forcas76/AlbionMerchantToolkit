@@ -9,7 +9,9 @@ __pycache__/
 .cache/
 data/*.db
 data/*.db-*
+!data/catalog.db
 app/ui/settings.json
 TECHNIKAI_ATTEKINTES.md
 SAJAT_OTLETEK.md
-tests
+terv.md
+KOVETKEZO_UI_ATRENDEZESI_TERV.md
