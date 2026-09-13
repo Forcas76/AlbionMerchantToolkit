@@ -522,9 +522,10 @@ class AlbionWindow(QMainWindow):
         for quality, label in QUALITY_LABELS.items():
             self.craft_quality.addItem(f"{quality} · {label}", quality)
         self.craft_source = QComboBox()
+        self.craft_recipe_rows: list[tuple] = []
+        self.selected_craft_row = -1
         self.craft_source.addItem("Alapanyag vásárlása", "buy")
         self.craft_source.addItem("Saját farmolás", "farm")
-        self.craft_source.currentIndexChanged.connect(self.show_recipe_materials)
         settings = load_craft_settings()
         self.craft_source.setCurrentIndex(1 if settings.material_source == "farm" else 0)
         self.premium = QCheckBox("Prémium")
@@ -554,8 +555,6 @@ class AlbionWindow(QMainWindow):
         self.craft_cards.item_selected.connect(self.select_craft_card)
         self.craft_cards.favorite_requested.connect(self.toggle_craft_favorite)
         setup_layout.addWidget(self.craft_cards)
-        self.recipe_list = QListWidget()
-        self.recipe_list.hide()
         for checkbox in self.craft_cities.checkboxes:
             checkbox.toggled.connect(self.show_recipe_materials)
         self.craft_splitter.addWidget(setup_group)
@@ -564,6 +563,7 @@ class AlbionWindow(QMainWindow):
         materials_layout = QVBoxLayout(materials_group)
         self.craft_materials = self._table()
         self.craft_materials.setMinimumHeight(150)
+        self.craft_source.currentIndexChanged.connect(self.show_recipe_materials)
         materials_layout.addWidget(self.craft_materials)
         craft_detail_layout.addWidget(materials_group)
 
@@ -1184,13 +1184,8 @@ class AlbionWindow(QMainWindow):
                 " ORDER BY i.name_en, r.item_uniquename, r.variant_index LIMIT 100",
                 parameters,
             ).fetchall()
-        self.recipe_list.clear()
-        self.recipe_list.setProperty("rows", rows)
-        for row in rows:
-            variant = f"V{row[3] + 1}" if row[3] else "alaprecept"
-            self.recipe_list.addItem(
-                f"{row[2] or row[1]}  ·  {row[1]}  ·  {variant}  ·  output: {row[4]}"
-            )
+        self.craft_recipe_rows = list(rows)
+        self.selected_craft_row = -1
 
         self.craft_row_by_item = {}
         card_rows = []
@@ -1206,8 +1201,7 @@ class AlbionWindow(QMainWindow):
         )
 
     def select_craft_card(self, selected: tuple) -> None:
-        row = self.craft_row_by_item.get(selected[0], -1)
-        self.recipe_list.setCurrentRow(row)
+        self.selected_craft_row = self.craft_row_by_item.get(selected[0], -1)
         self._reveal_craft_detail()
         self.show_recipe_materials()
 
@@ -1235,8 +1229,8 @@ class AlbionWindow(QMainWindow):
         self.craft_cards.set_favorite_state(item_id, enabled)
 
     def show_recipe_materials(self) -> None:
-        rows = self.recipe_list.property("rows") or []
-        current = self.recipe_list.currentRow()
+        rows = self.craft_recipe_rows
+        current = self.selected_craft_row
         if not rows or current < 0:
             self.craft_materials.clearContents()
             self.craft_materials.setRowCount(0)
@@ -1284,8 +1278,8 @@ class AlbionWindow(QMainWindow):
         )
 
     def calculate_craft(self) -> None:
-        rows = self.recipe_list.property("rows") or []
-        if not rows or self.recipe_list.currentRow() < 0:
+        rows = self.craft_recipe_rows
+        if not rows or self.selected_craft_row < 0:
             return
         save_craft_settings(CraftSettings(
             self.premium.isChecked(),
@@ -1293,7 +1287,7 @@ class AlbionWindow(QMainWindow):
             self.crafting_price.value(),
         ))
         recipe_id, output_id, output_name, _variant_index, output_amount = rows[
-            self.recipe_list.currentRow()
+            self.selected_craft_row
         ][:5]
         cities = self.craft_cities.selected_cities()
         if not cities:

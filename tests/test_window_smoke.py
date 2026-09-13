@@ -45,7 +45,10 @@ class WindowSmokeTests(unittest.TestCase):
         self.assertGreater(len(window.flip_cards.cards), 0)
         window.show_dashboard()
         self.assertEqual(set(window.dashboard_favorite_tables), {"price", "crafting", "flip"})
+        if hasattr(window, "craft_detail_animation"):
+            window.craft_detail_animation.stop()
         window.close()
+        self.app.processEvents()
 
 
 if __name__ == "__main__":
