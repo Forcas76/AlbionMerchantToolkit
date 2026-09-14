@@ -172,10 +172,82 @@ def _migration_004_market_identity(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_market_id ON items(market_id)")
 
 
+def _migration_005_refining_schema(conn: sqlite3.Connection) -> None:
+    """Add the configurable refining catalogue and imported direct recipes.
+
+    Refining is intentionally kept separate from the general crafting recipe
+    graph.  A refining recipe contains its direct materials only; the service
+    never recursively expands a material into another recipe.
+    """
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS refining_cities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city TEXT NOT NULL UNIQUE,
+            resource_type TEXT NOT NULL,
+            refined_item TEXT NOT NULL,
+            refined_item_id INTEGER REFERENCES items(id),
+            local_production_bonus REAL NOT NULL DEFAULT 0,
+            production_bonus REAL NOT NULL DEFAULT 0,
+            base_return_rate REAL NOT NULL DEFAULT 0.15,
+            focus_return_rate REAL NOT NULL DEFAULT 0,
+            station_fee INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS refining_recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            input_item_id INTEGER REFERENCES items(id),
+            input_item_uniquename TEXT,
+            output_item_id INTEGER REFERENCES items(id),
+            output_item_uniquename TEXT NOT NULL,
+            variant_index INTEGER NOT NULL DEFAULT 0,
+            input_amount INTEGER NOT NULL DEFAULT 0,
+            output_amount INTEGER NOT NULL DEFAULT 1,
+            silver_cost INTEGER NOT NULL DEFAULT 0,
+            craft_time_seconds REAL NOT NULL DEFAULT 0,
+            crafting_focus INTEGER NOT NULL DEFAULT 0,
+            imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(output_item_uniquename, variant_index)
+        );
+        CREATE TABLE IF NOT EXISTS refining_recipe_materials (
+            recipe_id INTEGER NOT NULL REFERENCES refining_recipes(id)
+                ON DELETE CASCADE,
+            material_item_id INTEGER REFERENCES items(id),
+            material_uniquename TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            returnable INTEGER NOT NULL DEFAULT 1,
+            max_return_amount INTEGER,
+            PRIMARY KEY(recipe_id, material_uniquename)
+        );
+        CREATE INDEX IF NOT EXISTS idx_refining_recipes_output
+            ON refining_recipes(output_item_uniquename, variant_index);
+        CREATE INDEX IF NOT EXISTS idx_refining_recipe_materials_item
+            ON refining_recipe_materials(material_uniquename);
+        """
+    )
+    # These are defaults, not hard-coded calculation rules.  Users may update
+    # any column (including the rates) through the refining service.
+    conn.executemany(
+        """INSERT OR IGNORE INTO refining_cities(
+               city, resource_type, refined_item, local_production_bonus,
+               production_bonus, base_return_rate, focus_return_rate
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            ("Fort Sterling", "wood", "planks", 0.35, 0.35, 0.15, 0.10),
+            ("Lymhurst", "fiber", "cloth", 0.35, 0.35, 0.15, 0.10),
+            ("Martlock", "hide", "leather", 0.35, 0.35, 0.15, 0.10),
+            ("Thetford", "ore", "metalbars", 0.35, 0.35, 0.15, 0.10),
+            ("Bridgewatch", "rock", "stoneblocks", 0.35, 0.35, 0.15, 0.10),
+        ),
+    )
+
+
 CATALOG_MIGRATIONS: tuple[Migration, ...] = (
     (1, "recipe variants and returnable materials", _migration_002_recipe_variants),
     (2, "item category hierarchy", _migration_003_item_category_tree),
     (3, "separate market item identity", _migration_004_market_identity),
+    (4, "configurable refining cities and direct recipes", _migration_005_refining_schema),
 )
 
 

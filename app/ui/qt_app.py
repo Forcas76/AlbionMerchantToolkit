@@ -56,6 +56,15 @@ from app.services.opportunity_scanner import scan_opportunities
 from app.services.item_catalog import import_item_categories as sync_item_category_data
 from app.services.favorites import favorite_ids, list_favorites, toggle_favorite
 from app.services.user_settings import get_int as get_user_int, set_int as set_user_int
+from app.services.refining import (
+    RefiningCityConfig,
+    calculate_refining as calculate_refining_result,
+    import_refining_recipes,
+    list_refining_recipes,
+    load_refining_cities,
+    market_prices_for_route,
+    save_refining_city,
+)
 from app.ui.rich_menu import CraftSettings, load_craft_settings, save_craft_settings
 from app.ui.item_cards import ItemCardGrid, ItemIconLoader
 from app.ui.market_cards import MarketCityCardGrid
@@ -206,6 +215,7 @@ class AlbionWindow(QMainWindow):
             ("Item keresés", "⌕", self.show_items),
             ("Market Scanner", "↗", self.show_flips),
             ("Crafting rendszer", "⚒", self.show_craft),
+            ("Refining Calculator", "◈", self.show_refining),
             ("Kedvencek", "★", self.show_favorites),
             ("Adatközpont", "⛁", self.show_database),
         )
@@ -224,6 +234,7 @@ class AlbionWindow(QMainWindow):
         self.pages.addWidget(self._items_page())
         self.pages.addWidget(self._flips_page())
         self.pages.addWidget(self._craft_page())
+        self.pages.addWidget(self._refining_page())
         self.pages.addWidget(self._favorites_page())
         self.pages.addWidget(self._database_page())
         shell.addWidget(sidebar)
@@ -598,6 +609,101 @@ class AlbionWindow(QMainWindow):
         self.craft_category.selection_changed.connect(self.search_recipes)
         return page
 
+    def _refining_page(self) -> QWidget:
+        page, layout = self._page(
+            "Refining Calculator",
+            "Közvetlen refining receptekből számolható beszerzés, visszatérő alapanyag, díj, adó és ROI. "
+            "A kalkulátor nem bontja ki a craft-receptfát.",
+        )
+        setup = QGroupBox("1 · Recept és útvonal")
+        setup_layout = QGridLayout(setup)
+        self.refining_search = QLineEdit()
+        self.refining_search.setPlaceholderText("Például: Planks, T4_PLANKS")
+        self.refining_search.returnPressed.connect(self.search_refining_recipes)
+        self.refining_recipe = QComboBox()
+        self.refining_recipe.setMinimumWidth(330)
+        self.refining_recipe.currentIndexChanged.connect(self._load_refining_profile)
+        self.refining_amount = QSpinBox()
+        self.refining_amount.setRange(1, 1_000_000)
+        self.refining_amount.setValue(1)
+        self.refining_amount.setSuffix(" batch")
+        search = QPushButton("Receptek keresése")
+        search.clicked.connect(self.search_refining_recipes)
+        import_button = QPushButton("Recipes importja")
+        import_button.clicked.connect(self.import_refining_data)
+        setup_layout.addWidget(QLabel("Recept keresése"), 0, 0)
+        setup_layout.addWidget(self.refining_search, 1, 0)
+        setup_layout.addWidget(search, 1, 1)
+        setup_layout.addWidget(import_button, 1, 2)
+        setup_layout.addWidget(QLabel("Recept"), 0, 3)
+        setup_layout.addWidget(self.refining_recipe, 1, 3)
+        setup_layout.addWidget(QLabel("Mennyiség"), 0, 4)
+        setup_layout.addWidget(self.refining_amount, 1, 4)
+        setup_layout.setColumnStretch(0, 1)
+        setup_layout.setColumnStretch(3, 2)
+        layout.addWidget(setup)
+
+        route = QGroupBox("2 · Városok és refining profil")
+        route_layout = QGridLayout(route)
+        self.refining_buy_city = QComboBox()
+        self.refining_city = QComboBox()
+        self.refining_sell_city = QComboBox()
+        self.refining_buy_city.addItems(CITIES)
+        self.refining_sell_city.addItems(CITIES)
+        with open_db() as conn:
+            refining_cities = load_refining_cities(conn)
+        self.refining_city.addItems([city.city for city in refining_cities])
+        self.refining_city.currentIndexChanged.connect(self._load_refining_profile)
+        self.refining_base_rrr = QSpinBox()
+        self.refining_base_rrr.setRange(0, 100)
+        self.refining_base_rrr.setSuffix(" %")
+        self.refining_focus_rrr = QSpinBox()
+        self.refining_focus_rrr.setRange(0, 100)
+        self.refining_focus_rrr.setSuffix(" %")
+        self.refining_station_fee = QSpinBox()
+        self.refining_station_fee.setRange(0, 2_000_000_000)
+        self.refining_station_fee.setSuffix(" silver / batch")
+        self.refining_transport_fee = QSpinBox()
+        self.refining_transport_fee.setRange(0, 2_000_000_000)
+        self.refining_transport_fee.setSuffix(" silver")
+        self.refining_premium = QCheckBox("Prémium market díjak")
+        self.refining_premium.setChecked(True)
+        self.refining_focus = QCheckBox("Focus használata")
+        save_profile = QPushButton("Profil mentése")
+        save_profile.clicked.connect(self.save_refining_profile)
+        route_layout.addWidget(QLabel("Vétel városa"), 0, 0)
+        route_layout.addWidget(self.refining_buy_city, 1, 0)
+        route_layout.addWidget(QLabel("Refine város"), 0, 1)
+        route_layout.addWidget(self.refining_city, 1, 1)
+        route_layout.addWidget(QLabel("Eladás városa"), 0, 2)
+        route_layout.addWidget(self.refining_sell_city, 1, 2)
+        route_layout.addWidget(QLabel("Alap RRR"), 0, 3)
+        route_layout.addWidget(self.refining_base_rrr, 1, 3)
+        route_layout.addWidget(QLabel("Focus RRR"), 0, 4)
+        route_layout.addWidget(self.refining_focus_rrr, 1, 4)
+        route_layout.addWidget(QLabel("Station fee"), 0, 5)
+        route_layout.addWidget(self.refining_station_fee, 1, 5)
+        route_layout.addWidget(QLabel("Transport"), 0, 6)
+        route_layout.addWidget(self.refining_transport_fee, 1, 6)
+        route_layout.addWidget(self.refining_premium, 2, 0, 1, 2)
+        route_layout.addWidget(self.refining_focus, 2, 2, 1, 2)
+        route_layout.addWidget(save_profile, 2, 4, 1, 2)
+        layout.addWidget(route)
+
+        result = QGroupBox("3 · Eredmény")
+        result_layout = QVBoxLayout(result)
+        calculate = QPushButton("Útvonal és ROI számítása")
+        calculate.clicked.connect(self.calculate_refining)
+        result_layout.addWidget(calculate, 0, Qt.AlignmentFlag.AlignLeft)
+        self.refining_output = QTextEdit()
+        self.refining_output.setReadOnly(True)
+        self.refining_output.setMinimumHeight(240)
+        result_layout.addWidget(self.refining_output)
+        layout.addWidget(result, 1)
+        self._load_refining_profile()
+        self.search_refining_recipes()
+        return page
+
     def _favorites_page(self) -> QWidget:
         page, layout = self._page(
             "Kedvencek",
@@ -900,13 +1006,180 @@ class AlbionWindow(QMainWindow):
     def show_craft(self) -> None:
         self._set_page(3)
 
-    def show_favorites(self) -> None:
+    def show_refining(self) -> None:
         self._set_page(4)
+
+    def show_favorites(self) -> None:
+        self._set_page(5)
         self.refresh_favorites()
 
     def show_database(self) -> None:
-        self._set_page(5)
+        self._set_page(6)
         self.refresh_dashboard()
+
+    def search_refining_recipes(self) -> None:
+        term = self.refining_search.text().strip()
+        parameters: list[object] = []
+        predicate = ""
+        if term:
+            predicate = "WHERE (i.name_en LIKE ? OR r.output_item_uniquename LIKE ?)"
+            parameters.extend((f"%{term}%", f"%{term}%"))
+        with open_db() as conn:
+            rows = conn.execute(
+                """SELECT r.output_item_uniquename, r.variant_index, i.name_en,
+                          i.tier, r.output_amount, COUNT(m.material_uniquename)
+                   FROM refining_recipes r
+                   JOIN items i ON i.id=r.output_item_id
+                   LEFT JOIN refining_recipe_materials m ON m.recipe_id=r.id
+                   """ + predicate +
+                """ GROUP BY r.id
+                   ORDER BY i.tier, i.name_en, r.output_item_uniquename,
+                            r.variant_index LIMIT 200""",
+                parameters,
+            ).fetchall()
+        self.refining_recipe.clear()
+        for output, variant, name, tier, amount, material_count in rows:
+            label = (
+                f"{name or output} · {output} · recept {variant + 1} "
+                f"({material_count} alapanyag, {amount} output)"
+            )
+            self.refining_recipe.addItem(label, (output, variant))
+        self.statusBar().showMessage(f"{len(rows)} refining recept")
+
+    def _load_refining_profile(self, _index: int = -1) -> None:
+        if not hasattr(self, "refining_city"):
+            return
+        city_name = self.refining_city.currentText()
+        with open_db() as conn:
+            profiles = {city.city: city for city in load_refining_cities(conn)}
+        profile = profiles.get(city_name)
+        if profile is None:
+            return
+        self.refining_base_rrr.setValue(round(float(profile.base_return_rate) * 100))
+        self.refining_focus_rrr.setValue(round(float(profile.focus_return_rate) * 100))
+        self.refining_station_fee.setValue(profile.station_fee)
+
+    def save_refining_profile(self) -> None:
+        city_name = self.refining_city.currentText()
+        with open_db() as conn:
+            profiles = {city.city: city for city in load_refining_cities(conn)}
+            profile = profiles.get(city_name)
+            if profile is None:
+                self.statusBar().showMessage("Nincs kiválasztott refining város.")
+                return
+            save_refining_city(
+                conn,
+                RefiningCityConfig(
+                    city=profile.city,
+                    resource_type=profile.resource_type,
+                    refined_item=profile.refined_item,
+                    local_production_bonus=profile.local_production_bonus,
+                    base_return_rate=self.refining_base_rrr.value() / 100,
+                    focus_return_rate=self.refining_focus_rrr.value() / 100,
+                    station_fee=self.refining_station_fee.value(),
+                    refined_item_id=profile.refined_item_id,
+                ),
+            )
+        self.statusBar().showMessage(f"Refining profil mentve: {city_name}")
+
+    def _selected_refining_recipe(self):
+        data = self.refining_recipe.currentData()
+        if not data:
+            return None
+        output, variant = data
+        with open_db() as conn:
+            recipes = list_refining_recipes(conn, output)
+        return next(
+            (recipe for recipe in recipes if recipe.variant_index == variant),
+            None,
+        )
+
+    def calculate_refining(self) -> None:
+        recipe = self._selected_refining_recipe()
+        if recipe is None:
+            self.refining_output.setPlainText(
+                "Nincs kiválasztott recept. Importáld az items.json refining receptjeit."
+            )
+            return
+        with open_db() as conn:
+            profiles = {city.city: city for city in load_refining_cities(conn)}
+            city = profiles.get(self.refining_city.currentText())
+            if city is None:
+                self.refining_output.setPlainText("Nincs érvényes refining profil.")
+                return
+            # User-editable values are applied to this calculation immediately;
+            # saving the profile is optional.
+            city = RefiningCityConfig(
+                city=city.city,
+                resource_type=city.resource_type,
+                refined_item=city.refined_item,
+                local_production_bonus=city.local_production_bonus,
+                base_return_rate=self.refining_base_rrr.value() / 100,
+                focus_return_rate=self.refining_focus_rrr.value() / 100,
+                station_fee=self.refining_station_fee.value(),
+                refined_item_id=city.refined_item_id,
+            )
+            material_prices, output_price = market_prices_for_route(
+                conn,
+                recipe,
+                self.refining_buy_city.currentText(),
+                self.refining_sell_city.currentText(),
+            )
+        result = calculate_refining_result(
+            recipe,
+            city,
+            material_prices=material_prices,
+            output_price=output_price,
+            batches=self.refining_amount.value(),
+            buy_city=self.refining_buy_city.currentText(),
+            sell_city=self.refining_sell_city.currentText(),
+            transport_fee=self.refining_transport_fee.value(),
+            station_fee=self.refining_station_fee.value(),
+            premium=self.refining_premium.isChecked(),
+            use_focus=self.refining_focus.isChecked(),
+        )
+        material_lines = "\n".join(
+            f"  {material.item_uniquename}: {material.required_amount:,} db · "
+            f"várható vissza {material.returned_amount} · effektív költség "
+            f"{material.effective_cost:,}"
+            for material in result.materials
+        )
+        focus_line = (
+            f"Focus: {result.focus_used:,} · Silver / Focus: "
+            f"{result.silver_per_focus}"
+            if result.focus_used
+            else "Focus: nem használva"
+        )
+        self.refining_output.setPlainText(
+            f"Recept: {recipe.output_item_uniquename} · {result.output_amount:,} output\n"
+            f"Útvonal: {result.buy_city} → {result.refining_city} → {result.sell_city}\n"
+            f"RRR: {result.return_rate * 100:.2f}%\n\n"
+            f"Alapanyagok:\n{material_lines}\n\n"
+            f"Input költség: {result.input_cost:,}\n"
+            f"Station fee: {result.station_fee:,}\n"
+            f"Transport: {result.transport_fee:,}\n"
+            f"Teljes befektetés: {result.total_cost:,}\n"
+            f"Bruttó bevétel: {result.gross_revenue:,}\n"
+            f"Market tax + listing: {result.market_tax + result.market_listing_fee:,}\n"
+            f"Nettó bevétel: {result.net_revenue:,}\n"
+            f"Profit: {result.profit:,} silver\n"
+            f"ROI: {result.roi_percent}%\n"
+            f"{focus_line}"
+        )
+
+    def import_refining_data(self) -> None:
+        def import_data() -> tuple[int, int, int]:
+            return import_refining_recipes()
+
+        def done(result: tuple[int, int, int]) -> None:
+            recipes, materials, unresolved = result
+            self.search_refining_recipes()
+            self.statusBar().showMessage(
+                f"Refining import kész: {recipes} recept, {materials} alapanyag, "
+                f"{unresolved} feloldatlan hivatkozás"
+            )
+
+        self.run_background(import_data, done)
 
     def refresh_favorites(self) -> None:
         with open_db() as conn:
