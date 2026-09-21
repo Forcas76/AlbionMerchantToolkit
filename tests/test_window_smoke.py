@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from app.ui.qt_app import AlbionWindow, open_db
+from app.core.database import connect_database
+from app.paths import CATALOG_DB_FILE
+from app.services.market_api import save_prices
+from app.ui import qt_app
 
 
 class WindowSmokeTests(unittest.TestCase):
@@ -15,12 +22,43 @@ class WindowSmokeTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temporary_directory.name)
+        self.catalog = root / "catalog.db"
+        self.market = root / "market.db"
+        self.user = root / "user.db"
+        shutil.copy2(CATALOG_DB_FILE, self.catalog)
+
+        def open_test_database():
+            return connect_database(self.catalog, self.market, self.user)
+
+        self.database_patch = patch.object(
+            qt_app, "open_db", side_effect=open_test_database
+        )
+        self.database_patch.start()
+        with qt_app.open_db() as conn:
+            save_prices(
+                conn,
+                [{
+                    "item_id": "T4_LEATHER_LEVEL1@1",
+                    "city": "Lymhurst",
+                    "quality": 1,
+                    "sell_price_min": 100,
+                    "buy_price_max": 90,
+                }],
+            )
+
+    def tearDown(self) -> None:
+        self.database_patch.stop()
+        self.temporary_directory.cleanup()
+
     def test_window_builds_with_split_databases(self) -> None:
-        window = AlbionWindow()
+        window = qt_app.AlbionWindow()
         self.app.processEvents()
         self.assertEqual(window.pages.count(), 10)
         self.assertTrue(window.item_splitter.childrenCollapsible() is False)
-        with open_db() as conn:
+        with qt_app.open_db() as conn:
             self.assertEqual(
                 conn.execute(
                     "SELECT market_id,enchantment FROM items WHERE uniquename=?",
@@ -28,9 +66,9 @@ class WindowSmokeTests(unittest.TestCase):
                 ).fetchone(),
                 ("T4_LEATHER_LEVEL1@1", 1),
             )
-            self.assertGreater(
+            self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM market_prices").fetchone()[0],
-                0,
+                1,
             )
         window.show_craft()
         window.search_recipes()
