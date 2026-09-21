@@ -9,6 +9,7 @@ recursive crafting planner.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_FLOOR
@@ -21,6 +22,7 @@ from app.paths import CATALOG_DB_FILE, ITEMS_FILE
 
 DB_FILE = str(CATALOG_DB_FILE)
 DEFAULT_ITEMS_FILE = str(ITEMS_FILE)
+LOGGER = logging.getLogger(__name__)
 
 
 def _decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
@@ -364,6 +366,7 @@ def import_refining_recipes(
     remain useful to the calculator and have a NULL internal item id.
     """
 
+    LOGGER.info("Refining import indul")
     with Path(items_file).open(encoding="utf-8") as source:
         raw_items = json.load(source)
     with closing(sqlite3.connect(str(db_file))) as conn:
@@ -452,6 +455,12 @@ def import_refining_recipes(
                     materials += 1
                 recipes += 1
         conn.commit()
+    LOGGER.info(
+        "Refining import kész | receptek=%s | anyagok=%s | feloldatlan=%s",
+        recipes,
+        materials,
+        unresolved,
+    )
     return recipes, materials, unresolved
 
 

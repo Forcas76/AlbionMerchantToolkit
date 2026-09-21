@@ -104,30 +104,36 @@ class ItemCard(QFrame):
         quality: int,
         icon_loader: ItemIconLoader,
         favorite: bool = False,
+        compact: bool = False,
+        show_favorite: bool = True,
     ) -> None:
         super().__init__()
         self.row = row
         self.quality = quality
         self.render_quality = quality or 1
         self.icon_loader = icon_loader
+        self.compact = compact
         self.icon_requested = False
         self.setObjectName("itemCard")
+        self.setProperty("compact", compact)
         self.setProperty("selected", False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(245, 118)
-        self.setMaximumHeight(128)
+        self.setMinimumSize(190 if compact else 245, 78 if compact else 118)
+        self.setMaximumHeight(86 if compact else 128)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         unique_name, name, tier, category, enchantment = row
         root = QHBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(12)
+        margin = 8 if compact else 12
+        root.setContentsMargins(margin, 7 if compact else 10, margin, 7 if compact else 10)
+        root.setSpacing(8 if compact else 12)
 
         self.icon = QLabel(f"T{tier}.{enchantment}")
         self.icon.setObjectName("itemIcon")
         self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.icon.setFixedSize(78, 78)
+        icon_size = 48 if compact else 78
+        self.icon.setFixedSize(icon_size, icon_size)
         root.addWidget(self.icon)
 
         text = QVBoxLayout()
@@ -138,11 +144,13 @@ class ItemCard(QFrame):
         title.setWordWrap(True)
         self.favorite_button = QPushButton()
         self.favorite_button.setObjectName("favoriteButton")
-        self.favorite_button.setFixedSize(30, 30)
+        favorite_size = 24 if compact else 30
+        self.favorite_button.setFixedSize(favorite_size, favorite_size)
         self.favorite_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.favorite_button.clicked.connect(
             lambda: self.favorite_requested.emit(unique_name)
         )
+        self.favorite_button.setVisible(show_favorite)
         self.set_favorite(favorite)
         title_row.addWidget(title, 1)
         title_row.addWidget(self.favorite_button)
@@ -223,9 +231,16 @@ class ItemCardGrid(QScrollArea):
     item_selected = pyqtSignal(object)
     favorite_requested = pyqtSignal(str)
 
-    def __init__(self, icon_loader: ItemIconLoader) -> None:
+    def __init__(
+        self,
+        icon_loader: ItemIconLoader,
+        compact: bool = False,
+        show_favorites: bool = True,
+    ) -> None:
         super().__init__()
         self.icon_loader = icon_loader
+        self.compact = compact
+        self.show_favorites = show_favorites
         self.setObjectName("itemCardScroll")
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -261,7 +276,14 @@ class ItemCardGrid(QScrollArea):
         self.cards = []
         self.current_card = None
         for row in rows:
-            card = ItemCard(row, quality, self.icon_loader, row[0] in (favorite_ids or set()))
+            card = ItemCard(
+                row,
+                quality,
+                self.icon_loader,
+                row[0] in (favorite_ids or set()),
+                self.compact,
+                self.show_favorites,
+            )
             card.selected.connect(lambda selected_row, source=card: self._select(source, selected_row))
             card.favorite_requested.connect(self.favorite_requested)
             self.cards.append(card)
@@ -285,7 +307,7 @@ class ItemCardGrid(QScrollArea):
         self.item_selected.emit(row)
 
     def _column_count(self) -> int:
-        return max(1, self.viewport().width() // 285)
+        return max(1, self.viewport().width() // (220 if self.compact else 285))
 
     def _relayout(self) -> None:
         while self.grid.takeAt(0) is not None:

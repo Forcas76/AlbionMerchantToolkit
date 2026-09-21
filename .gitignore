@@ -7,8 +7,14 @@ cf.py
 __pycache__/
 *.py[cod]
 .cache/
+build/
+dist/
+installer-output/
+logs/
+*.spec.tmp
 data/*.db
 data/*.db-*
+data/craft_settings.json
 !data/catalog.db
 app/ui/settings.json
 TECHNIKAI_ATTEKINTES.md

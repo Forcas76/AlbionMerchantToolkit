@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-import subprocess
 import sys
+import weakref
+import runpy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QEasingCurve, QObject, QStandardPaths, QThread, QTimer, Qt, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QAction, QFont
+from PyQt6.QtCore import QEasingCurve, QObject, QStandardPaths, QThread, QTimer, Qt, QUrl, QVariantAnimation, pyqtSignal
+from PyQt6.QtGui import QAction, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
+    QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -29,13 +32,14 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QScrollArea,
-    QSpinBox,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -65,12 +69,61 @@ from app.services.refining import (
     market_prices_for_route,
     save_refining_city,
 )
-from app.ui.rich_menu import CraftSettings, load_craft_settings, save_craft_settings
-from app.ui.item_cards import ItemCardGrid, ItemIconLoader
+from app.services.crafting import (
+    build_crafting_dependency_tree,
+    import_crafting_data as import_crafting_catalog,
+)
+from app.core.app_logging import (
+    LOG_DIR,
+    configure_logging,
+    export_diagnostic_bundle,
+    install_qt_message_logging,
+)
+from app.paths import ITEMS_FILE as ITEM_CATALOG_FILE, LOCALIZATION_FILE, PROJECT_ROOT
+from app.services.inventory import (
+    allocate_inventory,
+    get_quantity as get_inventory_quantity,
+    inventory_quantities,
+    list_inventory,
+    remove_item as remove_inventory_item,
+    set_quantity as set_inventory_quantity,
+)
+from app.services.trade_orders import (
+    OrderMaterialInput,
+    TradeOrderInput,
+    activate_order,
+    aggregate_order_profit,
+    aggregate_order_timeline,
+    available_months,
+    close_order,
+    closed_order_statistics,
+    create_order,
+    delete_order,
+    get_order,
+    list_orders,
+    update_order,
+)
+from app.services.craft_settings import CraftSettings, load_craft_settings, save_craft_settings
+from app.ui.item_cards import ItemCardGrid, ItemIconLoader, item_icon_url
 from app.ui.market_cards import MarketCityCardGrid
+from app.ui.crafting_cards import CraftingDependencyTreeView, CraftingMaterialCardGrid
+from app.ui.inventory_cards import InventoryCardGrid, InventoryPickerDialog
+from app.ui.inventory_price_cards import InventoryValuationGrid
+from app.ui.refining_cards import RefiningRecipeCardGrid
+from app.ui.trade_order_cards import (
+    CompactInventoryList,
+    OrderMaterialEditor,
+    StatisticsCardGrid,
+    TradeOrderCardList,
+)
+from app.ui.statistics_charts import (
+    ComparisonBarChart,
+    HorizontalBarChart,
+    TimelineChart,
+)
+from app.ui.safe_inputs import SafeComboBox as QComboBox, SafeSpinBox as QSpinBox
 from app.ui.category_picker import CategoryPopupButton
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 QUALITY_LABELS = {
     1: "Normal",
     2: "Good",
@@ -78,6 +131,7 @@ QUALITY_LABELS = {
     4: "Excellent",
     5: "Masterpiece",
 }
+LOGGER = logging.getLogger(__name__)
 
 
 def open_db() -> sqlite3.Connection:
@@ -95,6 +149,8 @@ class Worker(QObject):
         self.accepts_progress = accepts_progress
 
     def run(self) -> None:
+        operation_name = getattr(self.operation, "__qualname__", repr(self.operation))
+        LOGGER.info("Háttérfeladat indul: %s", operation_name)
         try:
             result = (
                 self.operation(self.progress.emit)
@@ -102,7 +158,9 @@ class Worker(QObject):
                 else self.operation()
             )
             self.finished.emit(result)
+            LOGGER.info("Háttérfeladat befejezve: %s", operation_name)
         except Exception as error:
+            LOGGER.exception("Háttérfeladat hibával leállt: %s", operation_name)
             self.failed.emit(str(error))
 
 
@@ -111,6 +169,93 @@ class SidebarButton(QPushButton):
         super().__init__(f"  {icon}   {text}")
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+
+class OpportunityCardGrid(QScrollArea):
+    """Compact card view for item/route opportunities instead of table rows."""
+
+    def __init__(self, icon_loader: ItemIconLoader) -> None:
+        super().__init__()
+        self.icon_loader = icon_loader
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setObjectName("opportunityScroll")
+        self.content = QWidget()
+        self.content.setObjectName("opportunityContent")
+        self.layout = QVBoxLayout(self.content)
+        self.layout.setContentsMargins(0, 2, 4, 2)
+        self.layout.setSpacing(8)
+        self.layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.setWidget(self.content)
+
+    def set_opportunities(
+        self,
+        rows: list[tuple],
+        include_item: bool = False,
+        item_id: str | None = None,
+    ) -> None:
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        for row in rows:
+            offset = 0
+            card = QFrame()
+            card.setObjectName("opportunityCard")
+            card_layout = QGridLayout(card)
+            card_layout.setContentsMargins(12, 8, 12, 8)
+            card_layout.setHorizontalSpacing(18)
+            icon_id = str(row[0]) if include_item else item_id
+            icon = QLabel("IMG")
+            icon.setObjectName("opportunityIcon")
+            icon.setFixedSize(52, 52)
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(icon, 0, 0, 2, 1)
+            if icon_id:
+                icon_ref = weakref.ref(icon)
+                self.icon_loader.request_icon(
+                    item_icon_url(icon_id, 1, 64),
+                    lambda pixmap, target=icon_ref: self._set_icon_ref(target, pixmap),
+                )
+            if include_item:
+                item_id = str(row[0])
+                title = QLabel(item_id)
+                title.setObjectName("opportunityItem")
+                card_layout.addWidget(title, 0, 1, 2, 1)
+                offset = 1
+            source, destination, quality, buy, sale, fees, profit, roi = row[offset:offset + 8]
+            display_column = 2 if include_item else 1
+            route = QLabel(f"{source}  ->  {destination}   |   Q{quality}")
+            route.setObjectName("opportunityRoute")
+            values = QLabel(
+                f"Vétel: {buy:,}    Célár: {sale:,}    Díjak: {fees:,}    "
+                f"Profit: {profit:,}    ROI: {roi}"
+            )
+            values.setObjectName("opportunityValues")
+            extra = row[offset + 8:]
+            if extra:
+                values.setText(
+                    f"{values.text()}    Adatkor: {extra[0]}"
+                    + (f"    Bizalom: {extra[1]}" if len(extra) > 1 else "")
+                )
+            card_layout.addWidget(route, 0, display_column)
+            card_layout.addWidget(values, 1, display_column)
+            self.layout.addWidget(card)
+
+    @staticmethod
+    def _set_icon(label: QLabel, pixmap) -> None:
+        if pixmap is not None:
+            label.setText("")
+            label.setPixmap(pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+        else:
+            label.setText("Nincs kép")
+
+    @staticmethod
+    def _set_icon_ref(label_ref, pixmap) -> None:
+        label = label_ref()
+        if label is not None:
+            OpportunityCardGrid._set_icon(label, pixmap)
 
 
 class CitySelector(QFrame):
@@ -160,6 +305,99 @@ class CitySelector(QFrame):
         return [checkbox.text() for checkbox in self.checkboxes if checkbox.isChecked()]
 
 
+class ItemPriceWindow(QDialog):
+    """Independent city-price window opened from an inventory card."""
+
+    def __init__(
+        self,
+        item_id: str,
+        item_name: str,
+        quality: int,
+        inventory_quantity: int,
+        premium: bool,
+        load_quotes: Callable[[str, int, list[str]], list[tuple]],
+        parent=None,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.item_id = item_id
+        self.quality = quality
+        self.load_quotes = load_quotes
+        self.setWindowTitle(f"Piaci árak · {item_name}")
+        self.resize(980, 720)
+        self.setMinimumSize(720, 520)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 20)
+        root.setSpacing(12)
+        title = QLabel(f"{item_name} · Q{quality}")
+        title.setObjectName("pageTitle")
+        identifier = QLabel(item_id)
+        identifier.setObjectName("itemCardId")
+        identifier.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(title)
+        root.addWidget(identifier)
+        scenario_controls = QHBoxLayout()
+        self.inventory_caption = QLabel(f"Készleten: {inventory_quantity:,} db")
+        self.inventory_caption.setObjectName("inventoryValueStock")
+        self.quantity = QSpinBox()
+        self.quantity.setRange(0, 2_000_000_000)
+        self.quantity.setValue(inventory_quantity)
+        self.quantity.setSuffix(" db számolva")
+        self.premium = QCheckBox("Prémium adóprofil")
+        self.premium.setChecked(premium)
+        scenario_controls.addWidget(self.inventory_caption)
+        scenario_controls.addStretch()
+        scenario_controls.addWidget(QLabel("Kísérleti mennyiség"))
+        scenario_controls.addWidget(self.quantity)
+        scenario_controls.addWidget(self.premium)
+        root.addLayout(scenario_controls)
+        self.fee_caption = QLabel()
+        self.fee_caption.setObjectName("pageDescription")
+        root.addWidget(self.fee_caption)
+        self.cities = CitySelector("Megjelenített városok")
+        root.addWidget(self.cities)
+        self.status = QLabel()
+        self.status.setObjectName("pageDescription")
+        root.addWidget(self.status)
+        self.cards = InventoryValuationGrid()
+        root.addWidget(self.cards, 1)
+        close = QPushButton("Ablak bezárása")
+        close.clicked.connect(self.close)
+        root.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(80)
+        self._refresh_timer.timeout.connect(self.refresh_quotes)
+        for checkbox in self.cities.checkboxes:
+            checkbox.toggled.connect(lambda _checked: self._refresh_timer.start())
+        self.quantity.valueChanged.connect(self.cards.set_quantity)
+        self.premium.toggled.connect(self._premium_changed)
+        self._premium_changed(self.premium.isChecked())
+        self.refresh_quotes()
+
+    def _premium_changed(self, checked: bool) -> None:
+        fees = market_fee_policy(checked)
+        self.cards.set_fees(fees)
+        self.fee_caption.setText(
+            f"Fix adóprofil: tranzakciós adó {fees.transaction_tax_bps / 100:.1f}% · "
+            f"sell order setup fee {fees.setup_fee_bps / 100:.1f}%"
+        )
+
+    def refresh_quotes(self) -> None:
+        cities = self.cities.selected_cities()
+        rows = self.load_quotes(self.item_id, self.quality, cities) if cities else []
+        self.cards.set_quotes(
+            rows,
+            self.quantity.value(),
+            market_fee_policy(self.premium.isChecked()),
+        )
+        if not cities:
+            self.status.setText("Nincs kijelölt város.")
+        elif rows:
+            self.status.setText(f"{len(rows)} városi árkártya · helyi market.db adatok")
+        else:
+            self.status.setText("A kijelölt városokhoz nincs eltárolt piaci adat.")
+
+
 class AlbionWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -172,6 +410,9 @@ class AlbionWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: Worker | None = None
         self.nav_buttons: list[SidebarButton] = []
+        self.inventory_price_windows: set[ItemPriceWindow] = set()
+        self.current_order_id: int | None = None
+        self.order_material_editors: list[OrderMaterialEditor] = []
         self._splitter_save_timers: dict[str, QTimer] = {}
         cache_location = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.CacheLocation
@@ -183,6 +424,11 @@ class AlbionWindow(QMainWindow):
         self._build_shell()
         self._apply_theme()
         self.refresh_dashboard()
+        LOGGER.info("Főablak felépítve")
+
+    def closeEvent(self, event) -> None:
+        LOGGER.info("Alkalmazásablak bezárása")
+        super().closeEvent(event)
 
     def _setup_actions(self) -> None:
         self.exit_action = QAction("Kilépés", self)
@@ -216,6 +462,9 @@ class AlbionWindow(QMainWindow):
             ("Market Scanner", "↗", self.show_flips),
             ("Crafting rendszer", "⚒", self.show_craft),
             ("Refining Calculator", "◈", self.show_refining),
+            ("Inventory", "▦", self.show_inventory),
+            ("Orderek", "▣", self.show_orders),
+            ("Statisztika", "▥", self.show_statistics),
             ("Kedvencek", "★", self.show_favorites),
             ("Adatközpont", "⛁", self.show_database),
         )
@@ -235,6 +484,9 @@ class AlbionWindow(QMainWindow):
         self.pages.addWidget(self._flips_page())
         self.pages.addWidget(self._craft_page())
         self.pages.addWidget(self._refining_page())
+        self.pages.addWidget(self._inventory_page())
+        self.pages.addWidget(self._orders_page())
+        self.pages.addWidget(self._statistics_page())
         self.pages.addWidget(self._favorites_page())
         self.pages.addWidget(self._database_page())
         shell.addWidget(sidebar)
@@ -273,24 +525,62 @@ class AlbionWindow(QMainWindow):
     def _dashboard_page(self) -> QWidget:
         page, layout = self._page(
             "Áttekintés",
-            "A három munkafolyamat kézzel összeállított kedvencei egy helyen.",
+            "A lezárt Orderek legfontosabb üzleti mutatói és trendjei egyetlen nézetben.",
         )
-        summary = QHBoxLayout()
-        summary.setSpacing(14)
-        self.dashboard_favorite_tables: dict[str, QTableWidget] = {}
-        for context, title in (
-            ("price", "Item-ár kedvencek"),
-            ("crafting", "Crafting kedvencek"),
-            ("flip", "Market flip kedvencek"),
+        controls = QHBoxLayout()
+        dashboard_label = QLabel("Idővonal bontása")
+        self.dashboard_interval = QComboBox()
+        self.dashboard_interval.addItem("Havonta", "month")
+        self.dashboard_interval.addItem("Hetente", "week")
+        self.dashboard_interval.addItem("Naponta", "day")
+        self.dashboard_interval.currentIndexChanged.connect(self.refresh_dashboard)
+        controls.addWidget(dashboard_label)
+        controls.addWidget(self.dashboard_interval)
+        controls.addStretch()
+        details = QPushButton("Részletes statisztika  ›")
+        details.clicked.connect(self.show_statistics)
+        controls.addWidget(details)
+        layout.addLayout(controls)
+
+        metrics = QHBoxLayout()
+        metrics.setSpacing(12)
+        self.dashboard_revenue = self._metric_card("Összbevétel", "0 silver")
+        self.dashboard_cost = self._metric_card("Teljes költség", "0 silver")
+        self.dashboard_profit = self._metric_card("Nettó profit", "0 silver")
+        self.dashboard_closed = self._metric_card("Lezárt Orderek", "0")
+        for card in (
+            self.dashboard_revenue, self.dashboard_cost,
+            self.dashboard_profit, self.dashboard_closed,
         ):
-            group = QGroupBox(title)
-            group_layout = QVBoxLayout(group)
-            table = self._table()
-            self.dashboard_favorite_tables[context] = table
-            group_layout.addWidget(table)
-            summary.addWidget(group, 1)
-        layout.addLayout(summary, 1)
-        layout.addStretch()
+            metrics.addWidget(card, 1)
+        layout.addLayout(metrics)
+
+        primary_charts = QHBoxLayout()
+        primary_charts.setSpacing(12)
+        self.dashboard_timeline = TimelineChart()
+        self.dashboard_comparison = ComparisonBarChart()
+        primary_charts.addWidget(self.dashboard_timeline, 2)
+        primary_charts.addWidget(self.dashboard_comparison, 1)
+        layout.addLayout(primary_charts)
+
+        rankings = QHBoxLayout()
+        rankings.setSpacing(12)
+        self.dashboard_items = HorizontalBarChart(
+            "Legjobb itemek", "Nettó profit quality szerint"
+        )
+        self.dashboard_cities = HorizontalBarChart(
+            "Legerősebb városok", "Nettó profit eladási város szerint"
+        )
+        rankings.addWidget(self.dashboard_items, 1)
+        rankings.addWidget(self.dashboard_cities, 1)
+        layout.addLayout(rankings)
+
+        recent_group = QGroupBox("Legutóbbi lezárt Orderek")
+        recent_layout = QVBoxLayout(recent_group)
+        self.dashboard_order_cards = StatisticsCardGrid()
+        self.dashboard_order_cards.setMinimumHeight(220)
+        recent_layout.addWidget(self.dashboard_order_cards)
+        layout.addWidget(recent_group)
         return page
 
     def _items_page(self) -> QWidget:
@@ -367,18 +657,28 @@ class AlbionWindow(QMainWindow):
         self.load_categories()
         self.item_category.selection_changed.connect(self.search_items)
         actions = QHBoxLayout()
-        prices = QPushButton("Piaci árak")
-        prices.setFixedWidth(120)
-        prices.clicked.connect(self.show_prices)
-        flips = QPushButton("Item flipjei")
-        flips.setFixedWidth(120)
-        flips.clicked.connect(self.show_item_flips)
-        history = QPushButton("14 nap history frissítése")
-        history.setFixedWidth(210)
-        history.clicked.connect(self.refresh_selected_history)
-        actions.addWidget(prices)
-        actions.addWidget(flips)
-        actions.addWidget(history)
+        actions.setSpacing(8)
+        actions.addWidget(
+            self._detail_action_card(
+                "Piaci árak",
+                "Városonkénti vételi és eladási árak",
+                self.show_prices,
+            )
+        )
+        actions.addWidget(
+            self._detail_action_card(
+                "Item flipjei",
+                "Legjobb városközi lehetőségek",
+                self.show_item_flips,
+            )
+        )
+        actions.addWidget(
+            self._detail_action_card(
+                "14 napos előzmény",
+                "Ártrendek frissítése",
+                self.refresh_selected_history,
+            )
+        )
         actions.addStretch()
         detail_layout.addLayout(actions)
         prices_title = QLabel("Piaci adatok")
@@ -386,7 +686,7 @@ class AlbionWindow(QMainWindow):
         detail_layout.addWidget(prices_title)
         self.item_detail_results = QStackedWidget()
         self.price_cards = MarketCityCardGrid(self.item_icon_loader)
-        self.item_table = self._table()
+        self.item_table = OpportunityCardGrid(self.item_icon_loader)
         self.item_detail_results.addWidget(self.price_cards)
         self.item_detail_results.addWidget(self.item_table)
         detail_layout.addWidget(self.item_detail_results, 1)
@@ -400,6 +700,22 @@ class AlbionWindow(QMainWindow):
         self.item_detail.hide()
         layout.addWidget(self.item_splitter, 1)
         return page
+
+    @staticmethod
+    def _detail_action_card(
+        title: str,
+        description: str,
+        callback: Callable[[], None],
+    ) -> QToolButton:
+        card = QToolButton()
+        card.setObjectName("detailActionCard")
+        card.setText(f"{title}\n{description}")
+        card.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        card.setMinimumHeight(58)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.clicked.connect(callback)
+        return card
 
     def _flips_page(self) -> QWidget:
         page, layout = self._page(
@@ -496,7 +812,7 @@ class AlbionWindow(QMainWindow):
         scan_actions.addWidget(all_items)
         scan_actions.addStretch()
         detail_layout.addLayout(scan_actions)
-        self.global_table = self._table()
+        self.global_table = OpportunityCardGrid(self.item_icon_loader)
         detail_layout.addWidget(self.global_table, 1)
         self.flip_splitter.addWidget(browser)
         self.flip_splitter.addWidget(self.flip_detail)
@@ -556,6 +872,10 @@ class AlbionWindow(QMainWindow):
         self.crafting_price.setSingleStep(100)
         self.crafting_price.setValue(settings.crafting_price)
         self.crafting_price.setSuffix(" silver / craft")
+        self.craft_batches = QSpinBox()
+        self.craft_batches.setRange(1, 1_000_000)
+        self.craft_batches.setValue(1)
+        self.craft_batches.setSuffix(" craft kör")
         craft_search_controls = QGridLayout()
         for column, label in enumerate(("Keresés", "Kategória", "Tier", "Enchant", "Quality")):
             craft_search_controls.addWidget(QLabel(label), 0, column)
@@ -565,6 +885,7 @@ class AlbionWindow(QMainWindow):
         form.addRow("Forrás", self.craft_source)
         form.addRow("", self.premium)
         form.addRow("Crafting állomásdíj", self.crafting_price)
+        form.addRow("Mennyiség", self.craft_batches)
         setup_layout.addLayout(form)
         self.craft_cities = CitySelector("Alapanyag- és értékesítési városok")
         setup_layout.addWidget(self.craft_cities)
@@ -582,13 +903,27 @@ class AlbionWindow(QMainWindow):
 
         materials_group = QGroupBox("2 · Szükséges alapanyagok")
         materials_layout = QVBoxLayout(materials_group)
-        self.craft_materials = self._table()
+        self.craft_materials = CraftingMaterialCardGrid(self.item_icon_loader)
         self.craft_materials.setMinimumHeight(150)
         self.craft_source.currentIndexChanged.connect(self.show_recipe_materials)
+        self.craft_batches.valueChanged.connect(self.show_recipe_materials)
         materials_layout.addWidget(self.craft_materials)
         craft_detail_layout.addWidget(materials_group)
 
-        result_group = QGroupBox("3 · Nettó crafting eredmény")
+        tree_group = QGroupBox("3 · Rekurzív crafting függőségek")
+        tree_layout = QVBoxLayout(tree_group)
+        tree_hint = QLabel(
+            "A vonalak a receptből a szükséges összetevők felé vezetnek. "
+            "A nyers vagy nem craftolható levelek is megjelennek; ciklus esetén a bontás leáll."
+        )
+        tree_hint.setObjectName("notice")
+        tree_hint.setWordWrap(True)
+        tree_layout.addWidget(tree_hint)
+        self.craft_dependency_tree = CraftingDependencyTreeView(self.item_icon_loader)
+        tree_layout.addWidget(self.craft_dependency_tree, 1)
+        craft_detail_layout.addWidget(tree_group, 2)
+
+        result_group = QGroupBox("4 · Nettó crafting eredmény")
         result_layout = QVBoxLayout(result_group)
         calculate = QPushButton("Költség és profit számítása")
         calculate.clicked.connect(self.calculate_craft)
@@ -620,9 +955,23 @@ class AlbionWindow(QMainWindow):
         self.refining_search = QLineEdit()
         self.refining_search.setPlaceholderText("Például: Planks, T4_PLANKS")
         self.refining_search.returnPressed.connect(self.search_refining_recipes)
+        self.refining_category = CategoryPopupButton()
+        self.refining_tier = QSpinBox()
+        self.refining_tier.setRange(1, 8)
+        self.refining_tier.setValue(4)
+        self.refining_enchantment = QComboBox()
+        self.refining_enchantment.addItem("Mind", -1)
+        for enchantment in range(5):
+            self.refining_enchantment.addItem(f".{enchantment}", enchantment)
+        self.refining_quality = QComboBox()
+        self.refining_quality.addItem("Mind", 0)
+        for quality, label in QUALITY_LABELS.items():
+            self.refining_quality.addItem(f"{quality} · {label}", quality)
         self.refining_recipe = QComboBox()
         self.refining_recipe.setMinimumWidth(330)
         self.refining_recipe.currentIndexChanged.connect(self._load_refining_profile)
+        self.refining_recipe_cards = RefiningRecipeCardGrid(self.item_icon_loader)
+        self.refining_recipe_cards.selected.connect(self._select_refining_recipe_card)
         self.refining_amount = QSpinBox()
         self.refining_amount.setRange(1, 1_000_000)
         self.refining_amount.setValue(1)
@@ -631,20 +980,32 @@ class AlbionWindow(QMainWindow):
         search.clicked.connect(self.search_refining_recipes)
         import_button = QPushButton("Recipes importja")
         import_button.clicked.connect(self.import_refining_data)
-        setup_layout.addWidget(QLabel("Recept keresése"), 0, 0)
+        for column, label in enumerate(("Item keresése", "Kategória", "Tier", "Enchant", "Quality")):
+            setup_layout.addWidget(QLabel(label), 0, column)
         setup_layout.addWidget(self.refining_search, 1, 0)
-        setup_layout.addWidget(search, 1, 1)
-        setup_layout.addWidget(import_button, 1, 2)
-        setup_layout.addWidget(QLabel("Recept"), 0, 3)
-        setup_layout.addWidget(self.refining_recipe, 1, 3)
-        setup_layout.addWidget(QLabel("Mennyiség"), 0, 4)
-        setup_layout.addWidget(self.refining_amount, 1, 4)
-        setup_layout.setColumnStretch(0, 1)
-        setup_layout.setColumnStretch(3, 2)
+        setup_layout.addWidget(self.refining_category, 1, 1)
+        setup_layout.addWidget(self.refining_tier, 1, 2)
+        setup_layout.addWidget(self.refining_enchantment, 1, 3)
+        setup_layout.addWidget(self.refining_quality, 1, 4)
+        amount_row = QHBoxLayout()
+        amount_row.addWidget(QLabel("Számolt mennyiség"))
+        amount_row.addWidget(self.refining_amount)
+        amount_row.addStretch()
+        amount_row.addWidget(search)
+        amount_row.addWidget(import_button)
+        setup_layout.addLayout(amount_row, 2, 0, 1, 5)
+        setup_layout.setColumnStretch(0, 2)
+        setup_layout.setColumnStretch(1, 1)
         layout.addWidget(setup)
+        recipe_heading = QLabel("Válassz refining receptet")
+        recipe_heading.setObjectName("sectionTitle")
+        layout.addWidget(recipe_heading)
+        layout.addWidget(self.refining_recipe_cards)
+        self.refining_recipe.hide()
 
         route = QGroupBox("2 · Városok és refining profil")
         route_layout = QGridLayout(route)
+        route_layout.setSpacing(12)
         self.refining_buy_city = QComboBox()
         self.refining_city = QComboBox()
         self.refining_sell_city = QComboBox()
@@ -671,23 +1032,37 @@ class AlbionWindow(QMainWindow):
         self.refining_focus = QCheckBox("Focus használata")
         save_profile = QPushButton("Profil mentése")
         save_profile.clicked.connect(self.save_refining_profile)
-        route_layout.addWidget(QLabel("Vétel városa"), 0, 0)
-        route_layout.addWidget(self.refining_buy_city, 1, 0)
-        route_layout.addWidget(QLabel("Refine város"), 0, 1)
-        route_layout.addWidget(self.refining_city, 1, 1)
-        route_layout.addWidget(QLabel("Eladás városa"), 0, 2)
-        route_layout.addWidget(self.refining_sell_city, 1, 2)
-        route_layout.addWidget(QLabel("Alap RRR"), 0, 3)
-        route_layout.addWidget(self.refining_base_rrr, 1, 3)
-        route_layout.addWidget(QLabel("Focus RRR"), 0, 4)
-        route_layout.addWidget(self.refining_focus_rrr, 1, 4)
-        route_layout.addWidget(QLabel("Station fee"), 0, 5)
-        route_layout.addWidget(self.refining_station_fee, 1, 5)
-        route_layout.addWidget(QLabel("Transport"), 0, 6)
-        route_layout.addWidget(self.refining_transport_fee, 1, 6)
-        route_layout.addWidget(self.refining_premium, 2, 0, 1, 2)
-        route_layout.addWidget(self.refining_focus, 2, 2, 1, 2)
-        route_layout.addWidget(save_profile, 2, 4, 1, 2)
+
+        cities_card = QFrame()
+        cities_card.setObjectName("refiningProfileCard")
+        cities_form = QFormLayout(cities_card)
+        cities_form.addRow(self._profile_card_title("Útvonal"))
+        cities_form.addRow("Vétel városa", self.refining_buy_city)
+        cities_form.addRow("Refine város", self.refining_city)
+        cities_form.addRow("Eladás városa", self.refining_sell_city)
+
+        returns_card = QFrame()
+        returns_card.setObjectName("refiningProfileCard")
+        returns_form = QFormLayout(returns_card)
+        returns_form.addRow(self._profile_card_title("Visszatérítés és focus"))
+        returns_form.addRow("Alap RRR", self.refining_base_rrr)
+        returns_form.addRow("Focus RRR", self.refining_focus_rrr)
+        returns_form.addRow("", self.refining_focus)
+        returns_form.addRow("", self.refining_premium)
+
+        costs_card = QFrame()
+        costs_card.setObjectName("refiningProfileCard")
+        costs_form = QFormLayout(costs_card)
+        costs_form.addRow(self._profile_card_title("Költségprofil"))
+        costs_form.addRow("Station fee", self.refining_station_fee)
+        costs_form.addRow("Transport", self.refining_transport_fee)
+        costs_form.addRow("", save_profile)
+
+        route_layout.addWidget(cities_card, 0, 0)
+        route_layout.addWidget(returns_card, 0, 1)
+        route_layout.addWidget(costs_card, 1, 0, 1, 2)
+        route_layout.setColumnStretch(0, 1)
+        route_layout.setColumnStretch(1, 1)
         layout.addWidget(route)
 
         result = QGroupBox("3 · Eredmény")
@@ -701,7 +1076,256 @@ class AlbionWindow(QMainWindow):
         result_layout.addWidget(self.refining_output)
         layout.addWidget(result, 1)
         self._load_refining_profile()
+        self.load_categories()
+        self.refining_category.selection_changed.connect(self.search_refining_recipes)
         self.search_refining_recipes()
+        return page
+
+    def _inventory_page(self) -> QWidget:
+        page, layout = self._page(
+            "Inventory",
+            "Személyes készlet darabban és 999-es stackekben. A crafting kalkulátor ebből fedezi először az alapanyagokat.",
+        )
+        toolbar = QHBoxLayout()
+        add_item = QPushButton("＋ Item hozzáadása")
+        add_item.clicked.connect(self.open_inventory_picker)
+        self.inventory_filter = QLineEdit()
+        self.inventory_filter.setPlaceholderText("Szűrés a saját készletben…")
+        self.inventory_filter.textChanged.connect(self.refresh_inventory)
+        toolbar.addWidget(add_item)
+        toolbar.addWidget(self.inventory_filter, 1)
+        layout.addLayout(toolbar)
+        hint = QLabel(
+            "A mennyiséget közvetlenül a kártyán módosíthatod. A változás a Mentés gombbal kerül az adatbázisba."
+        )
+        hint.setObjectName("notice")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.inventory_cards = InventoryCardGrid(self.item_icon_loader)
+        self.inventory_cards.save_requested.connect(self.save_inventory_card)
+        self.inventory_cards.remove_requested.connect(self.delete_inventory_card)
+        self.inventory_cards.price_requested.connect(self.open_inventory_price_window)
+        layout.addWidget(self.inventory_cards, 1)
+        self.refresh_inventory()
+        return page
+
+    def _orders_page(self) -> QWidget:
+        page, layout = self._page(
+            "Orderek",
+            "Névre mentett kereskedelmi projektek. A készlet csak az aktív Order lezárásakor csökken.",
+        )
+        toolbar = QHBoxLayout()
+        new_button = QPushButton("＋ Új Order")
+        new_button.clicked.connect(self.new_order)
+        self.order_status_filter = QComboBox()
+        self.order_status_filter.addItem("Minden állapot", None)
+        self.order_status_filter.addItem("Tervezett", "draft")
+        self.order_status_filter.addItem("Aktív", "active")
+        self.order_status_filter.addItem("Lezárt", "closed")
+        self.order_status_filter.currentIndexChanged.connect(self.refresh_orders)
+        toolbar.addWidget(new_button)
+        toolbar.addStretch()
+        toolbar.addWidget(QLabel("Szűrés"))
+        toolbar.addWidget(self.order_status_filter)
+        layout.addLayout(toolbar)
+
+        self.order_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.order_splitter.setObjectName("masterDetailSplitter")
+        self.order_splitter.setChildrenCollapsible(False)
+        self.order_cards = TradeOrderCardList(self.item_icon_loader)
+        self.order_cards.selected.connect(self.load_order)
+        self.order_cards.setMinimumWidth(330)
+        self.order_splitter.addWidget(self.order_cards)
+
+        self.order_editor = QFrame()
+        self.order_editor.setObjectName("detailPanel")
+        editor = QVBoxLayout(self.order_editor)
+        editor.setContentsMargins(18, 16, 18, 16)
+        editor.setSpacing(12)
+        header = QHBoxLayout()
+        title = QLabel("Order szerkesztése")
+        title.setObjectName("sectionTitle")
+        self.order_state_label = QLabel("Új · tervezett")
+        self.order_state_label.setObjectName("orderEditorStatus")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.order_state_label)
+        editor.addLayout(header)
+
+        identity = QGroupBox("Projekt és eladás")
+        form = QGridLayout(identity)
+        self.order_name = QLineEdit()
+        self.order_name.setPlaceholderText("Például: T4 táska – Caerleon")
+        self.order_output_label = QLabel("Nincs kiválasztott eladási item")
+        self.order_output_label.setObjectName("orderOutputSelection")
+        choose_output = QPushButton("Kiválasztás")
+        choose_output.setToolTip("Eladási item kiválasztása")
+        choose_output.clicked.connect(lambda: self.open_order_item_picker("output"))
+        self.order_choose_output = choose_output
+        self.order_output_id = ""
+        self.order_output_quality = 1
+        self.order_output_quantity = QSpinBox()
+        self.order_output_quantity.setRange(1, 2_000_000_000)
+        self.order_output_quantity.setValue(1)
+        self.order_output_quantity.setSuffix(" db")
+        self.order_sold_quantity = QSpinBox()
+        self.order_sold_quantity.setRange(0, 2_000_000_000)
+        self.order_sold_quantity.setSuffix(" db eladva")
+        self.order_planned_price = QSpinBox()
+        self.order_planned_price.setRange(0, 2_000_000_000)
+        self.order_planned_price.setSuffix(" silver/db")
+        self.order_actual_price = QSpinBox()
+        self.order_actual_price.setRange(0, 2_000_000_000)
+        self.order_actual_price.setSpecialValueText("Még nincs")
+        self.order_actual_price.setSuffix(" silver/db")
+        self.order_sale_city = QComboBox()
+        self.order_sale_city.addItems(CITIES)
+        self.order_sale_method = QComboBox()
+        self.order_sale_method.addItem("Sell order", "sell_order")
+        self.order_sale_method.addItem("Azonnali eladás", "instant")
+        self.order_premium = QCheckBox("Prémium díjszabás")
+        self.order_premium.setChecked(True)
+        form.addWidget(QLabel("Order neve"), 0, 0)
+        form.addWidget(self.order_name, 1, 0, 1, 4)
+        form.addWidget(QLabel("Eladási item"), 2, 0)
+        form.addWidget(self.order_output_label, 3, 0, 1, 3)
+        form.addWidget(choose_output, 3, 3)
+        form.addWidget(QLabel("Teljes mennyiség"), 4, 0)
+        form.addWidget(self.order_output_quantity, 5, 0, 1, 2)
+        form.addWidget(QLabel("Eladott mennyiség"), 4, 2)
+        form.addWidget(self.order_sold_quantity, 5, 2, 1, 2)
+        form.addWidget(QLabel("Tervezett darabár"), 6, 0)
+        form.addWidget(self.order_planned_price, 7, 0, 1, 2)
+        form.addWidget(QLabel("Tényleges darabár"), 6, 2)
+        form.addWidget(self.order_actual_price, 7, 2, 1, 2)
+        form.addWidget(QLabel("Eladás városa"), 8, 0)
+        form.addWidget(self.order_sale_city, 9, 0, 1, 2)
+        form.addWidget(QLabel("Eladási mód"), 8, 2)
+        form.addWidget(self.order_sale_method, 9, 2, 1, 2)
+        form.addWidget(self.order_premium, 10, 0, 1, 4)
+        for column in range(4):
+            form.setColumnStretch(column, 1)
+        editor.addWidget(identity)
+
+        material_header = QHBoxLayout()
+        material_title = QLabel("Alapanyagok")
+        material_title.setObjectName("sectionTitle")
+        add_material = QPushButton("＋ Alapanyag")
+        add_material.clicked.connect(lambda: self.open_order_item_picker("material"))
+        self.order_add_material = add_material
+        material_header.addWidget(material_title)
+        material_header.addStretch()
+        material_header.addWidget(add_material)
+        editor.addLayout(material_header)
+        material_scroll = QScrollArea()
+        material_scroll.setWidgetResizable(True)
+        material_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        material_scroll.setMinimumHeight(190)
+        self.order_material_content = QWidget()
+        self.order_material_layout = QVBoxLayout(self.order_material_content)
+        self.order_material_layout.setContentsMargins(0, 0, 4, 0)
+        self.order_material_layout.setSpacing(7)
+        self.order_material_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        material_scroll.setWidget(self.order_material_content)
+        editor.addWidget(material_scroll, 1)
+
+        actions = QHBoxLayout()
+        self.order_save_button = QPushButton("Mentés")
+        self.order_save_button.clicked.connect(lambda: self.save_order())
+        self.order_activate_button = QPushButton("Aktiválás")
+        self.order_activate_button.clicked.connect(self.activate_current_order)
+        self.order_close_button = QPushButton("Order lezárása")
+        self.order_close_button.setToolTip("Lezárás és inventory-készlet levonása")
+        self.order_close_button.clicked.connect(self.close_current_order)
+        self.order_delete_button = QPushButton("Törlés")
+        self.order_delete_button.setObjectName("dangerButton")
+        self.order_delete_button.clicked.connect(self.delete_current_order)
+        actions.addWidget(self.order_save_button)
+        actions.addWidget(self.order_activate_button)
+        actions.addWidget(self.order_close_button)
+        actions.addStretch()
+        actions.addWidget(self.order_delete_button)
+        editor.addLayout(actions)
+        self.order_splitter.addWidget(self.order_editor)
+        self.order_splitter.setSizes([390, 780])
+        self.order_splitter.setStretchFactor(0, 1)
+        self.order_splitter.setStretchFactor(1, 2)
+        self.order_splitter.splitterMoved.connect(
+            lambda *_: self._schedule_splitter_save("orders", self.order_splitter)
+        )
+        layout.addWidget(self.order_splitter, 1)
+        self.new_order()
+        self.refresh_orders()
+        return page
+
+    def _statistics_page(self) -> QWidget:
+        page, layout = self._page(
+            "Statisztika",
+            "A lezárt Orderek tényleges bevétele, új készpénzes költsége és nettó profitja.",
+        )
+        filters = QHBoxLayout()
+        self.statistics_month = QComboBox()
+        self.statistics_month.currentIndexChanged.connect(self.refresh_statistics)
+        self.statistics_group = QComboBox()
+        self.statistics_group.addItem("Orderenként", "order")
+        self.statistics_group.addItem("Itemenként", "item")
+        self.statistics_group.addItem("Városonként", "city")
+        self.statistics_group.currentIndexChanged.connect(self.refresh_statistics)
+        self.statistics_interval = QComboBox()
+        self.statistics_interval.addItem("Havi grafikon", "month")
+        self.statistics_interval.addItem("Heti grafikon", "week")
+        self.statistics_interval.addItem("Napi grafikon", "day")
+        self.statistics_interval.currentIndexChanged.connect(self.refresh_statistics)
+        filters.addWidget(QLabel("Hónap"))
+        filters.addWidget(self.statistics_month)
+        filters.addWidget(QLabel("Csoportosítás"))
+        filters.addWidget(self.statistics_group)
+        filters.addWidget(QLabel("Idővonal"))
+        filters.addWidget(self.statistics_interval)
+        filters.addStretch()
+        layout.addLayout(filters)
+        metrics = QHBoxLayout()
+        self.statistics_revenue = self._metric_card("Bruttó bevétel", "0")
+        self.statistics_cost = self._metric_card("Teljes költség", "0")
+        self.statistics_profit = self._metric_card("Nettó profit", "0")
+        metrics.addWidget(self.statistics_revenue)
+        metrics.addWidget(self.statistics_cost)
+        metrics.addWidget(self.statistics_profit)
+        layout.addLayout(metrics)
+        chart_row = QHBoxLayout()
+        chart_row.setSpacing(12)
+        self.statistics_timeline = TimelineChart()
+        self.statistics_comparison = ComparisonBarChart()
+        chart_row.addWidget(self.statistics_timeline, 2)
+        chart_row.addWidget(self.statistics_comparison, 1)
+        layout.addLayout(chart_row)
+        ranking_row = QHBoxLayout()
+        ranking_row.setSpacing(12)
+        self.statistics_items = HorizontalBarChart(
+            "Itemek profitja", "A kiválasztott időszak legerősebb itemei"
+        )
+        self.statistics_cities = HorizontalBarChart(
+            "Városok profitja", "A kiválasztott időszak eladási városai"
+        )
+        ranking_row.addWidget(self.statistics_items, 1)
+        ranking_row.addWidget(self.statistics_cities, 1)
+        layout.addLayout(ranking_row)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        inventory_box = QGroupBox("Aktuális inventory")
+        inventory_layout = QVBoxLayout(inventory_box)
+        self.statistics_inventory = CompactInventoryList()
+        inventory_layout.addWidget(self.statistics_inventory)
+        results_box = QGroupBox("Lezárt Orderek")
+        results_layout = QVBoxLayout(results_box)
+        self.statistics_cards = StatisticsCardGrid()
+        results_layout.addWidget(self.statistics_cards)
+        splitter.addWidget(inventory_box)
+        splitter.addWidget(results_box)
+        splitter.setSizes([390, 780])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+        self.refresh_statistics(reload_months=True)
         return page
 
     def _favorites_page(self) -> QWidget:
@@ -713,13 +1337,13 @@ class AlbionWindow(QMainWindow):
         refresh.clicked.connect(self.refresh_favorites)
         layout.addWidget(refresh, 0, Qt.AlignmentFlag.AlignLeft)
         self.favorite_tabs = QTabWidget()
-        self.favorite_tables: dict[str, QTableWidget] = {}
+        self.favorite_tables: dict[str, ItemCardGrid] = {}
         for context, label in (
             ("price", "Item-ár"),
             ("crafting", "Crafting"),
             ("flip", "Market flip"),
         ):
-            table = self._table()
+            table = ItemCardGrid(self.item_icon_loader, compact=True)
             self.favorite_tables[context] = table
             self.favorite_tabs.addTab(table, label)
         layout.addWidget(self.favorite_tabs, 1)
@@ -748,6 +1372,18 @@ class AlbionWindow(QMainWindow):
         craft_import.clicked.connect(self.import_crafting_data)
         category_import = QPushButton("Kategóriafa frissítése")
         category_import.clicked.connect(self.refresh_item_categories)
+        has_items = ITEM_CATALOG_FILE.exists()
+        has_full_catalog_source = has_items and LOCALIZATION_FILE.exists()
+        rebuild.setEnabled(has_full_catalog_source)
+        craft_import.setEnabled(has_items)
+        category_import.setEnabled(has_items)
+        if not has_full_catalog_source:
+            rebuild.setToolTip(
+                "A telepítőben nincs items.json/localization.json; a beépített katalógus használható."
+            )
+        if not has_items:
+            craft_import.setToolTip("Az importhoz items.json szükséges.")
+            category_import.setToolTip("A frissítéshez items.json szükséges.")
         buttons.addWidget(status)
         buttons.addWidget(one)
         buttons.addWidget(all_items)
@@ -770,6 +1406,25 @@ class AlbionWindow(QMainWindow):
         warning.setObjectName("notice")
         warning.setWordWrap(True)
         layout.addWidget(warning)
+        diagnostics_group = QGroupBox("Hibajelentés és naplók")
+        diagnostics_layout = QVBoxLayout(diagnostics_group)
+        diagnostics_help = QLabel(
+            "Ha hibát tapasztalsz, ments egy diagnosztikai ZIP-et, és küldd el a "
+            "fejlesztőnek. A csomag naplókat és műszaki adatokat tartalmaz, "
+            "személyes adatbázisokat nem."
+        )
+        diagnostics_help.setWordWrap(True)
+        diagnostics_layout.addWidget(diagnostics_help)
+        diagnostics_buttons = QHBoxLayout()
+        log_folder = QPushButton("Log mappa megnyitása")
+        log_folder.clicked.connect(self.open_log_folder)
+        diagnostics = QPushButton("Diagnosztikai ZIP mentése")
+        diagnostics.clicked.connect(self.export_diagnostics)
+        diagnostics_buttons.addWidget(log_folder)
+        diagnostics_buttons.addWidget(diagnostics)
+        diagnostics_buttons.addStretch()
+        diagnostics_layout.addLayout(diagnostics_buttons)
+        layout.addWidget(diagnostics_group)
         layout.addStretch()
         return page
 
@@ -780,12 +1435,20 @@ class AlbionWindow(QMainWindow):
         layout = QVBoxLayout(card)
         caption = QLabel(label)
         caption.setObjectName("metricLabel")
+        caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         number = QLabel(value)
         number.setObjectName("metricValue")
+        number.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         card.value_label = number
         layout.addWidget(caption)
         layout.addWidget(number)
         return card
+
+    @staticmethod
+    def _profile_card_title(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("profileCardTitle")
+        return label
 
     @staticmethod
     def _action_card(title: str, description: str, callback: Callable[[], None]) -> QFrame:
@@ -836,6 +1499,15 @@ class AlbionWindow(QMainWindow):
             }
             QPushButton:hover { background: #263c4a; border-color: #e0a842; }
             QPushButton:pressed, QPushButton:checked { background: #d99a31; color: #10161d; }
+            #detailActionCard {
+                background: #16232d; border: 1px solid #2d4655; border-radius: 8px;
+                color: #dce7ed; padding: 8px 12px; text-align: left;
+                font-weight: 650;
+            }
+            #detailActionCard:hover {
+                background: #223743; border-color: #d99a31; color: #ffffff;
+            }
+            #detailActionCard:pressed { background: #735321; color: #ffffff; }
             #sidebar QPushButton { text-align: left; border: 0; background: transparent; color: #9badba; }
             #sidebar QPushButton:hover { background: #172630; color: #fff; }
             #sidebar QPushButton:checked { background: #d99a31; color: #10161d; }
@@ -849,6 +1521,12 @@ class AlbionWindow(QMainWindow):
             #itemCard {
                 background: #151f28; border: 1px solid #293d49; border-radius: 11px;
             }
+            #itemCard[compact="true"] {
+                border-radius: 8px; min-height: 76px; max-height: 86px;
+            }
+            #itemCard[compact="true"] #itemCardTitle { font-size: 12px; }
+            #itemCard[compact="true"] #itemCardMeta { font-size: 10px; }
+            #itemCard[compact="true"] #itemCardId { font-size: 9px; }
             #itemCard:hover { background: #1a2832; border-color: #8b6a31; }
             #itemCard[selected="true"] {
                 background: #292419; border: 2px solid #d99a31;
@@ -861,6 +1539,133 @@ class AlbionWindow(QMainWindow):
             #itemCardTitle { color: #f3f6f8; font-size: 14px; font-weight: 750; }
             #itemCardMeta { color: #d9ad5d; font-size: 11px; }
             #itemCardId { color: #718592; font-family: Consolas; font-size: 10px; }
+            #inventoryScroll, #inventoryContent { background: transparent; border: 0; }
+            #inventoryCard {
+                background: #151f28; border: 1px solid #293d49; border-radius: 11px;
+            }
+            #inventoryCard:hover { background: #192731; border-color: #7d6235; }
+            #inventoryIcon {
+                background: #0c141a; border: 1px solid #2d414d; border-radius: 9px;
+                color: #7f929f; font-weight: 700;
+            }
+            #inventoryTitle { color: #f3f6f8; font-size: 14px; font-weight: 750; }
+            #inventoryMeta, #inventoryTotal { color: #d9ad5d; font-weight: 650; }
+            #inventoryId, #inventoryUpdated {
+                color: #718592; font-family: Consolas; font-size: 10px;
+            }
+            #inventoryRemove {
+                background: #342126; border: 1px solid #68404a;
+                border-radius: 14px; padding: 0; font-size: 13px; font-weight: 800;
+            }
+            #inventoryRemove:hover { background: #4a2931; border-color: #b85e70; }
+            #inventorySelection { color: #d9ad5d; font-weight: 650; }
+            #inventoryCategorySection, #inventoryCategoryBody { background: transparent; border: 0; }
+            #inventoryCategoryToggle {
+                background: #17242e; border: 1px solid #2b414e; border-radius: 8px;
+                color: #e7edf3; padding: 9px 12px; text-align: left; font-weight: 750;
+            }
+            #inventoryCategoryToggle:hover { background: #20333f; border-color: #8b6a31; }
+            #inventoryEmpty { color: #8194a1; padding: 50px; font-size: 14px; }
+            #inventoryValueScroll, #inventoryValueContent { background: transparent; border: 0; }
+            #inventoryValueCard {
+                background: #151f28; border: 1px solid #2c4351; border-radius: 10px;
+            }
+            #inventoryValueCity { color: #f3f6f8; font-size: 15px; font-weight: 800; }
+            #inventoryValueStock {
+                color: #f2b84b; background: #2b2418; border: 1px solid #725a2d;
+                border-radius: 10px; padding: 4px 9px; font-weight: 750;
+            }
+            #inventoryValueMarketPrice { color: #d9ad5d; font-weight: 700; }
+            #inventoryValueInstant, #inventoryValueScenario {
+                background: #101920; border: 1px solid #273b47; border-radius: 7px;
+            }
+            #inventoryValueCaption { color: #8fa1ae; font-weight: 650; }
+            #inventoryValueResult { color: #70d3a2; font-size: 14px; font-weight: 800; }
+            #opportunityScroll, #opportunityContent { background: transparent; border: 0; }
+            #opportunityCard {
+                background: #151f28; border: 1px solid #293d49; border-radius: 9px;
+            }
+            #opportunityCard:hover { background: #1a2832; border-color: #8b6a31; }
+            #opportunityItem { color: #f2b84b; font-weight: 750; min-width: 180px; }
+            #opportunityRoute { color: #dce7ed; font-weight: 650; }
+            #opportunityValues { color: #9fb0ba; }
+            #recipeCardScroll, #recipeCardContent { background: transparent; border: 0; }
+            #recipeCard {
+                background: #151f28; border: 1px solid #293d49; border-radius: 8px;
+                color: #dce7ed; padding: 12px; text-align: left;
+                font-size: 12px; font-weight: 650;
+            }
+            #recipeCard:hover { background: #1a2832; border-color: #8b6a31; }
+            #recipeCard:checked { background: #292419; border: 2px solid #d99a31; color: #ffffff; }
+            #refiningRecipeScroll, #refiningRecipeContent { background: transparent; border: 0; }
+            #refiningRecipeCard {
+                background: #151f28; border: 1px solid #293d49; border-radius: 10px;
+            }
+            #refiningRecipeCard:hover { background: #1a2832; border-color: #8b6a31; }
+            #refiningRecipeCard[selected="true"] {
+                background: #292419; border: 2px solid #d99a31;
+            }
+            #refiningRecipeIcon {
+                background: #0c141a; border: 1px solid #2d414d; border-radius: 9px;
+                color: #7f929f; font-weight: 750;
+            }
+            #refiningRecipeTitle { color: #f3f6f8; font-size: 14px; font-weight: 800; }
+            #refiningRecipeMeta { color: #d9ad5d; font-size: 11px; font-weight: 650; }
+            #refiningRecipeId { color: #718592; font-family: Consolas; font-size: 9px; }
+            #refiningRecipeBadge {
+                color: #f2b84b; background: #2b2418; border: 1px solid #725a2d;
+                border-radius: 9px; padding: 3px 7px; font-size: 10px; font-weight: 750;
+            }
+            #refiningProfileCard {
+                background: #151f28; border: 1px solid #293d49;
+                border-radius: 10px; padding: 10px;
+            }
+            #profileCardTitle {
+                color: #f2b84b; font-size: 15px; font-weight: 800;
+                padding-bottom: 6px;
+            }
+            #craftMaterialScroll, #craftMaterialContent {
+                background: transparent; border: 0;
+            }
+            #craftMaterialCard {
+                background: #151f28; border: 1px solid #293d49; border-radius: 8px;
+            }
+            #craftMaterialCard:hover {
+                background: #1a2832; border-color: #8b6a31;
+            }
+            #craftMaterialIcon, #craftingNodeIcon {
+                background: #0c141a; border: 1px solid #2d414d; border-radius: 7px;
+                color: #7f929f; font-size: 10px; font-weight: 700;
+            }
+            #craftMaterialTitle, #craftingNodeTitle {
+                color: #f2b84b; font-weight: 750;
+            }
+            #craftMaterialMeta, #craftingNodeQuantity {
+                color: #dce7ed; font-size: 11px; font-weight: 650;
+            }
+            #craftMaterialId, #craftingNodeId {
+                color: #718592; font-family: Consolas; font-size: 9px;
+            }
+            #craftMaterialCard QLabel {
+                color: #9fb0ba; font-size: 10px;
+            }
+            #craftingTreeView {
+                background: #0d141b; border: 1px solid #263b49; border-radius: 8px;
+            }
+            #craftingNodeCard {
+                background: #151f28; border: 1px solid #2b414e; border-radius: 10px;
+            }
+            #craftingNodeCard[raw="true"] {
+                background: #17292a; border-color: #35615a;
+            }
+            #craftingNodeCard[cycle="true"] {
+                background: #342224; border-color: #934e4e;
+            }
+            #craftingNodeStatus, #craftingNodePrice {
+                color: #9fb0ba; font-size: 10px;
+            }
+            #craftingNodeCard[raw="true"] #craftingNodeStatus { color: #76c4a1; }
+            #craftingNodeCard[cycle="true"] #craftingNodeStatus { color: #ef8585; }
             #favoriteButton {
                 border: 0; background: transparent; color: #8ea0ac;
                 font-size: 22px; padding: 0;
@@ -932,6 +1737,41 @@ class AlbionWindow(QMainWindow):
             #cityChip:checked { background: #4b391d; border-color: #d99a31; color: #fff2d2; }
             #metricLabel { color: #8093a1; font-size: 11px; font-weight: 700; }
             #metricValue { color: #f2b84b; font-size: 27px; font-weight: 800; }
+            #tradeOrderScroll { background: transparent; border: 0; }
+            #tradeOrderCard, #orderMaterialCard, #statisticsOrderCard,
+            #statisticsInventoryCard {
+                background: #151f28; border: 1px solid #2b414e; border-radius: 10px;
+            }
+            #tradeOrderCard:hover { background: #1b2a34; border-color: #8b6a31; }
+            #tradeOrderCard[selected="true"] {
+                background: #292419; border: 2px solid #d99a31;
+            }
+            #tradeOrderIcon {
+                background: #0c141a; border: 1px solid #2d414d; border-radius: 8px;
+                color: #718592; font-weight: 700;
+            }
+            #tradeOrderTitle, #orderMaterialTitle, #statisticsCardTitle,
+            #statisticsInventoryTitle { color: #f3f6f8; font-weight: 800; }
+            #tradeOrderMeta, #orderMaterialId { color: #8093a1; font-size: 10px; }
+            #tradeOrderAmount, #statisticsInventoryAmount {
+                color: #d9ad5d; font-weight: 750;
+            }
+            #tradeOrderStatus, #orderEditorStatus {
+                background: #243541; color: #b9c9d3; border-radius: 8px;
+                padding: 3px 8px; font-size: 10px; font-weight: 750;
+            }
+            #tradeOrderStatus[status="active"] { background: #173b2b; color: #70d3a2; }
+            #tradeOrderStatus[status="closed"] { background: #2b2418; color: #f2b84b; }
+            #orderOutputSelection { color: #d9ad5d; font-weight: 700; }
+            #orderMaterialRemove {
+                background: #342126; border: 1px solid #68404a; border-radius: 15px; padding: 4px;
+            }
+            #orderMaterialRemove:hover, #dangerButton:hover {
+                background: #4a2931; border-color: #b85e70;
+            }
+            #dangerButton { background: #342126; border-color: #68404a; }
+            #statisticsOrderCard { padding: 5px; }
+            #statisticsProfit { color: #70d3a2; font-size: 15px; font-weight: 800; }
             #actionCard { min-width: 220px; min-height: 150px; padding: 4px; }
             #actionTitle { color: #f2b84b; font-size: 17px; font-weight: 700; }
             #databaseStatus { background: #17232d; border: 1px solid #263b49; border-radius: 8px; padding: 16px; font-size: 16px; }
@@ -992,6 +1832,7 @@ class AlbionWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         for number, button in enumerate(self.nav_buttons):
             button.setChecked(number == index)
+        LOGGER.debug("Oldalváltás: index=%s", index)
 
     def show_dashboard(self) -> None:
         self._set_page(0)
@@ -1009,42 +1850,504 @@ class AlbionWindow(QMainWindow):
     def show_refining(self) -> None:
         self._set_page(4)
 
-    def show_favorites(self) -> None:
+    def show_inventory(self) -> None:
         self._set_page(5)
+        self.refresh_inventory()
+
+    def show_orders(self) -> None:
+        self._set_page(6)
+        total_width = self.order_splitter.width()
+        if total_width > 0:
+            target = self._splitter_target("orders", total_width, 6700)
+            self.order_splitter.setSizes([max(300, total_width - target), target])
+        self.refresh_orders()
+
+    def show_statistics(self) -> None:
+        self._set_page(7)
+        self.refresh_statistics(reload_months=True)
+
+    def show_favorites(self) -> None:
+        self._set_page(8)
         self.refresh_favorites()
 
     def show_database(self) -> None:
-        self._set_page(6)
+        self._set_page(9)
         self.refresh_dashboard()
+
+    def new_order(self) -> None:
+        self.current_order_id = None
+        self.order_name.clear()
+        self.order_output_id = ""
+        self.order_output_quality = 1
+        self.order_output_label.setText("Nincs kiválasztott eladási item")
+        self.order_output_quantity.setValue(1)
+        self.order_sold_quantity.setValue(0)
+        self.order_planned_price.setValue(0)
+        self.order_actual_price.setValue(0)
+        self.order_sale_city.setCurrentIndex(0)
+        self.order_sale_method.setCurrentIndex(0)
+        self.order_premium.setChecked(True)
+        self._clear_order_materials()
+        self._set_order_editor_state("draft", is_new=True)
+
+    def _clear_order_materials(self) -> None:
+        for material in self.order_material_editors:
+            self.order_material_layout.removeWidget(material)
+            material.deleteLater()
+        self.order_material_editors.clear()
+
+    def _add_order_material(
+        self,
+        item_id: str,
+        name: str,
+        quality: int,
+        purchased: int = 0,
+        inventory: int = 0,
+        unit_price: int = 0,
+        city: str = "Caerleon",
+    ) -> None:
+        material = OrderMaterialEditor(
+            item_id, name, quality, purchased, inventory, unit_price, city
+        )
+        material.remove_requested.connect(self._remove_order_material)
+        self.order_material_editors.append(material)
+        self.order_material_layout.addWidget(material)
+
+    def _remove_order_material(self, material: OrderMaterialEditor) -> None:
+        if material not in self.order_material_editors:
+            return
+        self.order_material_editors.remove(material)
+        self.order_material_layout.removeWidget(material)
+        material.deleteLater()
+
+    def open_order_item_picker(self, target: str) -> None:
+        category_rows, counts = self._category_data()
+        dialog = InventoryPickerDialog(
+            self.item_icon_loader,
+            self._inventory_picker_items,
+            category_rows,
+            counts,
+            self,
+            show_quantity=False,
+            action_label="Kiválasztás",
+            window_title=(
+                "Eladási item kiválasztása" if target == "output"
+                else "Alapanyag kiválasztása"
+            ),
+        )
+        if not dialog.exec() or dialog.selected_row is None:
+            return
+        item_id = str(dialog.selected_row[0])
+        name = str(dialog.selected_row[1] or item_id)
+        quality = dialog.selected_quality()
+        if target == "output":
+            self.order_output_id = item_id
+            self.order_output_quality = quality
+            self.order_output_label.setText(f"{name} · {item_id} · Q{quality}")
+        else:
+            self._add_order_material(item_id, name, quality)
+
+    def _order_input(self) -> TradeOrderInput:
+        materials = tuple(
+            OrderMaterialInput(
+                item_uniquename=widget.item_id,
+                quality=widget.quality,
+                purchased_quantity=widget.purchased.value(),
+                inventory_quantity=widget.inventory.value(),
+                purchased_unit_price=widget.unit_price.value(),
+                purchase_city=widget.city.currentText(),
+            )
+            for widget in self.order_material_editors
+        )
+        actual = self.order_actual_price.value()
+        return TradeOrderInput(
+            name=self.order_name.text().strip(),
+            output_item_uniquename=self.order_output_id,
+            output_quality=self.order_output_quality,
+            output_quantity=self.order_output_quantity.value(),
+            sold_quantity=self.order_sold_quantity.value(),
+            planned_unit_price=self.order_planned_price.value(),
+            actual_unit_price=actual if actual > 0 else None,
+            sale_city=self.order_sale_city.currentText(),
+            sale_method=str(self.order_sale_method.currentData()),
+            premium=self.order_premium.isChecked(),
+            materials=materials,
+        )
+
+    def save_order(self, *, quiet: bool = False) -> bool:
+        try:
+            value = self._order_input()
+            with open_db() as conn:
+                if self.current_order_id is None:
+                    self.current_order_id = create_order(conn, value)
+                else:
+                    update_order(conn, self.current_order_id, value)
+            self.refresh_orders()
+            self.load_order(self.current_order_id)
+            if not quiet:
+                self.statusBar().showMessage("Order mentve.")
+            return True
+        except (ValueError, sqlite3.Error) as error:
+            LOGGER.warning("Order nem menthető", exc_info=True)
+            QMessageBox.warning(self, "Order nem menthető", str(error))
+            return False
+
+    def refresh_orders(self, _value=0) -> None:
+        if not hasattr(self, "order_cards"):
+            return
+        status = self.order_status_filter.currentData()
+        with open_db() as conn:
+            rows = list_orders(conn, status)
+        self.order_cards.set_orders(list(rows), self.current_order_id)
+
+    def load_order(self, order_id: int) -> None:
+        try:
+            with open_db() as conn:
+                order, materials = get_order(conn, order_id)
+        except (ValueError, sqlite3.Error) as error:
+            LOGGER.warning("Order nem tölthető be | id=%s", order_id, exc_info=True)
+            QMessageBox.warning(self, "Order betöltési hiba", str(error))
+            return
+        self.current_order_id = int(order[0])
+        self.order_name.setText(str(order[1]))
+        self.order_output_id = str(order[3])
+        self.order_output_quality = int(order[4])
+        with open_db() as conn:
+            name_row = conn.execute(
+                "SELECT COALESCE(name_en,uniquename) FROM items WHERE uniquename=?",
+                (self.order_output_id,),
+            ).fetchone()
+        output_name = str(name_row[0]) if name_row else self.order_output_id
+        self.order_output_label.setText(
+            f"{output_name} · {self.order_output_id} · Q{self.order_output_quality}"
+        )
+        self.order_output_quantity.setValue(int(order[5]))
+        self.order_sold_quantity.setValue(int(order[6]))
+        self.order_planned_price.setValue(int(order[7]))
+        self.order_actual_price.setValue(int(order[8] or 0))
+        self.order_sale_city.setCurrentText(str(order[9]))
+        method_index = self.order_sale_method.findData(str(order[10]))
+        self.order_sale_method.setCurrentIndex(max(0, method_index))
+        self.order_premium.setChecked(bool(order[11]))
+        self._clear_order_materials()
+        for _id, item_id, name, quality, purchased, inventory, price, city in materials:
+            self._add_order_material(
+                str(item_id), str(name), int(quality), int(purchased),
+                int(inventory), int(price), str(city),
+            )
+        self._set_order_editor_state(str(order[2]))
+        self.refresh_orders()
+
+    def _set_order_editor_state(self, status: str, *, is_new: bool = False) -> None:
+        labels = {"draft": "Tervezett", "active": "Aktív", "closed": "Lezárt"}
+        self.order_state_label.setText(
+            ("Új · " if is_new else "") + labels.get(status, status)
+        )
+        closed = status == "closed"
+        for widget in (
+            self.order_name, self.order_output_quantity, self.order_sold_quantity,
+            self.order_planned_price, self.order_actual_price, self.order_sale_city,
+            self.order_sale_method, self.order_premium, self.order_choose_output,
+            self.order_add_material,
+        ):
+            widget.setEnabled(not closed)
+        for material in self.order_material_editors:
+            material.set_read_only(closed)
+        self.order_save_button.setEnabled(not closed)
+        self.order_activate_button.setEnabled(status == "draft" and not is_new)
+        self.order_close_button.setEnabled(status == "active")
+        self.order_delete_button.setEnabled(not closed and not is_new)
+
+    def activate_current_order(self) -> None:
+        if self.current_order_id is None or not self.save_order(quiet=True):
+            return
+        try:
+            with open_db() as conn:
+                activate_order(conn, self.current_order_id)
+            self.load_order(self.current_order_id)
+            self.statusBar().showMessage("Order aktiválva.")
+        except (ValueError, sqlite3.Error) as error:
+            LOGGER.warning("Order aktiválása sikertelen", exc_info=True)
+            QMessageBox.warning(self, "Aktiválás sikertelen", str(error))
+
+    def close_current_order(self) -> None:
+        if self.current_order_id is None or not self.save_order(quiet=True):
+            return
+        if QMessageBox.question(
+            self,
+            "Order lezárása",
+            "Lezárod az Ordert és levonod a megadott inventory-mennyiségeket?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            with open_db() as conn:
+                close_order(conn, self.current_order_id)
+            self.load_order(self.current_order_id)
+            self.refresh_inventory()
+            self.refresh_statistics(reload_months=True)
+            self.refresh_dashboard()
+            self.statusBar().showMessage("Order lezárva, a készlet levonva.")
+        except (ValueError, sqlite3.Error) as error:
+            LOGGER.warning("Order lezárása sikertelen", exc_info=True)
+            QMessageBox.warning(self, "Lezárás sikertelen", str(error))
+
+    def delete_current_order(self) -> None:
+        if self.current_order_id is None:
+            return
+        if QMessageBox.question(
+            self, "Order törlése", "Biztosan törlöd ezt a még le nem zárt Ordert?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            with open_db() as conn:
+                delete_order(conn, self.current_order_id)
+            self.new_order()
+            self.refresh_orders()
+            self.statusBar().showMessage("Order törölve.")
+        except (ValueError, sqlite3.Error) as error:
+            LOGGER.warning("Order törlése sikertelen", exc_info=True)
+            QMessageBox.warning(self, "Törlés sikertelen", str(error))
+
+    def refresh_statistics(self, _value=0, *, reload_months: bool = False) -> None:
+        if not hasattr(self, "statistics_cards"):
+            return
+        with open_db() as conn:
+            months = available_months(conn)
+            inventory = list_inventory(conn)
+        if reload_months:
+            selected = self.statistics_month.currentData()
+            self.statistics_month.blockSignals(True)
+            self.statistics_month.clear()
+            self.statistics_month.addItem("Összes hónap", None)
+            for month in months:
+                self.statistics_month.addItem(month, month)
+            index = self.statistics_month.findData(selected)
+            self.statistics_month.setCurrentIndex(max(0, index))
+            self.statistics_month.blockSignals(False)
+        with open_db() as conn:
+            orders = closed_order_statistics(conn, self.statistics_month.currentData())
+        grouping = str(self.statistics_group.currentData())
+        grouped: dict[object, dict[str, object]] = {}
+        for row in orders:
+            if grouping == "item":
+                key = (row["item_id"], row["quality"])
+                label = f"{row['item_id']} · Q{row['quality']}"
+            elif grouping == "city":
+                key = row["city"]
+                label = str(row["city"])
+            else:
+                key = row["id"]
+                label = f"{row['name']} · {row['item_id']} · {row['city']}"
+            target = grouped.setdefault(key, {
+                "label": label, "quantity": 0, "gross": 0,
+                "purchase_cost": 0, "fees": 0, "net_profit": 0,
+            })
+            row["fees"] = int(row["transaction_tax"]) + int(row["setup_fee"])
+            for field in ("quantity", "gross", "purchase_cost", "fees", "net_profit"):
+                target[field] = int(target[field]) + int(row[field])
+        result_rows = sorted(
+            grouped.values(), key=lambda row: int(row["net_profit"]), reverse=True
+        )
+        self.statistics_inventory.set_rows(list(inventory))
+        self.statistics_cards.set_rows(result_rows)
+        gross = sum(int(row["gross"]) for row in orders)
+        cost = sum(
+            int(row["purchase_cost"]) + int(row["transaction_tax"]) + int(row["setup_fee"])
+            for row in orders
+        )
+        profit = sum(int(row["net_profit"]) for row in orders)
+        self.statistics_revenue.value_label.setText(f"{gross:,} silver")
+        self.statistics_cost.value_label.setText(f"{cost:,} silver")
+        self.statistics_profit.value_label.setText(f"{profit:,} silver")
+        self.statistics_timeline.set_data(
+            aggregate_order_timeline(orders, str(self.statistics_interval.currentData()))
+        )
+        self.statistics_comparison.set_totals(gross, cost, profit)
+        self.statistics_items.set_data(aggregate_order_profit(orders, "item"))
+        self.statistics_cities.set_data(aggregate_order_profit(orders, "city"))
+
+    def _inventory_picker_items(
+        self,
+        term: str,
+        tier: int,
+        enchantment: int,
+        category_path: tuple[str, ...],
+    ) -> list[tuple]:
+        predicates = ["1=1"]
+        parameters: list[object] = []
+        if term:
+            predicates.append("(name_en LIKE ? COLLATE NOCASE OR uniquename LIKE ? COLLATE NOCASE)")
+            parameters.extend((f"%{term}%", f"%{term}%"))
+        if tier:
+            predicates.append("tier=?")
+            parameters.append(tier)
+        for column, category_id in zip(
+            ("shopcategory", "shopsubcategory", "shopsubcategory2", "shopsubcategory3"),
+            category_path,
+            strict=False,
+        ):
+            predicates.append(f"{column}=?")
+            parameters.append(category_id)
+        if enchantment >= 0:
+            predicates.append("enchantment=?")
+            parameters.append(enchantment)
+        with open_db() as conn:
+            return conn.execute(
+                """SELECT uniquename, COALESCE(name_en, uniquename), tier,
+                          shopcategory, enchantment
+                   FROM items WHERE """ + " AND ".join(predicates) +
+                " ORDER BY name_en, enchantment, uniquename LIMIT 150",
+                parameters,
+            ).fetchall()
+
+    def open_inventory_picker(self) -> None:
+        category_rows, counts = self._category_data()
+        dialog = InventoryPickerDialog(
+            self.item_icon_loader,
+            self._inventory_picker_items,
+            category_rows,
+            counts,
+            self,
+        )
+        if not dialog.exec() or dialog.selected_row is None:
+            return
+        item_id = str(dialog.selected_row[0])
+        quantity = dialog.quantity()
+        quality = dialog.selected_quality()
+        with open_db() as conn:
+            set_inventory_quantity(conn, item_id, quantity, quality)
+        self.refresh_inventory()
+        self.show_recipe_materials()
+        self.statusBar().showMessage(
+            f"Inventoryhoz adva: {item_id} · Q{quality} · {quantity:,} db"
+        )
+
+    def refresh_inventory(self) -> None:
+        if not hasattr(self, "inventory_cards"):
+            return
+        with open_db() as conn:
+            rows = list_inventory(conn, self.inventory_filter.text())
+        self.inventory_cards.set_inventory(list(rows))
+
+    def save_inventory_card(self, item_id: str, quality: int, quantity: int) -> None:
+        with open_db() as conn:
+            set_inventory_quantity(conn, item_id, quantity, quality)
+        self.refresh_inventory()
+        self.show_recipe_materials()
+        self.statusBar().showMessage(
+            f"Készlet mentve: {item_id} · Q{quality} · {quantity:,} db"
+        )
+
+    @staticmethod
+    def _inventory_price_quotes(
+        item_id: str, quality: int, cities: list[str]
+    ) -> list[tuple]:
+        if not cities:
+            return []
+        placeholders = ",".join("?" for _ in cities)
+        with open_db() as conn:
+            return conn.execute(
+                f"""SELECT city, quality, enchantment,
+                           sell_price_min, sell_price_min_date,
+                           sell_price_max, sell_price_max_date,
+                           buy_price_min, buy_price_min_date,
+                           buy_price_max, buy_price_max_date
+                    FROM market_prices
+                    WHERE item_uniquename=? AND quality=?
+                      AND city IN ({placeholders})
+                      AND (sell_price_min > 0 OR buy_price_max > 0)
+                    ORDER BY city, enchantment""",
+                (item_id, quality, *cities),
+            ).fetchall()
+
+    def open_inventory_price_window(self, item_id: str, quality: int) -> None:
+        with open_db() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(name_en, uniquename) FROM items WHERE uniquename=?",
+                (item_id,),
+            ).fetchone()
+            inventory_quantity = get_inventory_quantity(conn, item_id, quality)
+        item_name = str(row[0]) if row else item_id
+        window = ItemPriceWindow(
+            item_id,
+            item_name,
+            quality,
+            inventory_quantity,
+            self.premium.isChecked() if hasattr(self, "premium") else True,
+            self._inventory_price_quotes,
+            self,
+        )
+        self.inventory_price_windows.add(window)
+        window.finished.connect(
+            lambda _result, target=window: self.inventory_price_windows.discard(target)
+        )
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def delete_inventory_card(self, item_id: str, quality: int) -> None:
+        if QMessageBox.question(
+            self,
+            "Inventory elem törlése",
+            f"Biztosan törlöd az inventoryból?\n{item_id} · Q{quality}",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        with open_db() as conn:
+            remove_inventory_item(conn, item_id, quality)
+        self.refresh_inventory()
+        self.show_recipe_materials()
+        self.statusBar().showMessage(f"Készletből törölve: {item_id}")
 
     def search_refining_recipes(self) -> None:
         term = self.refining_search.text().strip()
-        parameters: list[object] = []
-        predicate = ""
-        if term:
-            predicate = "WHERE (i.name_en LIKE ? OR r.output_item_uniquename LIKE ?)"
-            parameters.extend((f"%{term}%", f"%{term}%"))
+        predicates, parameters = self._catalog_item_predicates(
+            "i",
+            term,
+            self.refining_tier.value(),
+            self.refining_enchantment.currentData(),
+            self.refining_category.selected_path,
+        )
+        predicates.append(
+            "EXISTS (SELECT 1 FROM refining_recipes rr "
+            "WHERE rr.output_item_id = i.id)"
+        )
+        quality = self.refining_quality.currentData()
+        if quality:
+            predicates.append(
+                "EXISTS (SELECT 1 FROM market_prices mp "
+                "WHERE mp.item_uniquename = i.uniquename AND mp.quality = ?)"
+            )
+            parameters.append(quality)
         with open_db() as conn:
             rows = conn.execute(
                 """SELECT r.output_item_uniquename, r.variant_index, i.name_en,
                           i.tier, r.output_amount, COUNT(m.material_uniquename)
-                   FROM refining_recipes r
-                   JOIN items i ON i.id=r.output_item_id
-                   LEFT JOIN refining_recipe_materials m ON m.recipe_id=r.id
-                   """ + predicate +
+                  FROM refining_recipes r
+                  JOIN items i ON i.id=r.output_item_id
+                  LEFT JOIN refining_recipe_materials m ON m.recipe_id=r.id
+                  WHERE """ + " AND ".join(predicates) +
                 """ GROUP BY r.id
                    ORDER BY i.tier, i.name_en, r.output_item_uniquename,
                             r.variant_index LIMIT 200""",
                 parameters,
             ).fetchall()
         self.refining_recipe.clear()
+        recipe_rows: list[tuple] = []
         for output, variant, name, tier, amount, material_count in rows:
             label = (
                 f"{name or output} · {output} · recept {variant + 1} "
                 f"({material_count} alapanyag, {amount} output)"
             )
             self.refining_recipe.addItem(label, (output, variant))
+            recipe_rows.append((output, name or output, f"T{tier}", f"{material_count} alapanyag", f"{amount} output", variant))
+        self.refining_recipe_cards.set_recipes(recipe_rows)
+        if recipe_rows:
+            self.refining_recipe_cards._select(0)
         self.statusBar().showMessage(f"{len(rows)} refining recept")
+
+    def _select_refining_recipe_card(self, index: int) -> None:
+        if 0 <= index < self.refining_recipe.count():
+            self.refining_recipe.setCurrentIndex(index)
 
     def _load_refining_profile(self, _index: int = -1) -> None:
         if not hasattr(self, "refining_city"):
@@ -1187,14 +2490,10 @@ class AlbionWindow(QMainWindow):
         grouped = {context: [] for context in self.favorite_tables}
         for context, item_id, name, tier, enchantment, created_at in rows:
             grouped[context].append(
-                (name or item_id, item_id, f"T{tier}" if tier else "-", f".{enchantment or 0}", created_at)
+                (item_id, name or item_id, tier or 0, "", enchantment or 0)
             )
-        for context, table in self.favorite_tables.items():
-            self.fill_table(
-                table,
-                ["Item", "Unique name", "Tier", "Enchant", "Hozzáadva"],
-                grouped[context],
-            )
+        for context, cards in self.favorite_tables.items():
+            cards.set_items(grouped[context], 0, favorite_ids={row[0] for row in grouped[context]})
 
     def refresh_dashboard(self) -> None:
         try:
@@ -1206,23 +2505,58 @@ class AlbionWindow(QMainWindow):
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipes'"
                 ).fetchone()
                 recipes = conn.execute("SELECT COUNT(*) FROM recipes").fetchone()[0] if recipe_table else 0
-                favorites = list_favorites(conn)
-            grouped = {context: [] for context in self.dashboard_favorite_tables}
-            for context, item_id, name, tier, enchantment, _created_at in favorites:
-                grouped[context].append((name or item_id, f"T{tier}.{enchantment or 0}"))
-            for context, table in self.dashboard_favorite_tables.items():
-                self.fill_table(table, ["Item", "Szint"], grouped[context][:12])
+                order_rows = closed_order_statistics(conn)
+            recent_orders = order_rows[:5]
+            gross = sum(int(row["gross"]) for row in order_rows)
+            cost = sum(
+                int(row["purchase_cost"]) + int(row["transaction_tax"]) + int(row["setup_fee"])
+                for row in order_rows
+            )
+            profit = sum(int(row["net_profit"]) for row in order_rows)
+            self.dashboard_revenue.value_label.setText(f"{gross:,} silver")
+            self.dashboard_cost.value_label.setText(f"{cost:,} silver")
+            self.dashboard_profit.value_label.setText(f"{profit:,} silver")
+            self.dashboard_closed.value_label.setText(f"{len(order_rows):,}")
+            self.dashboard_timeline.set_data(aggregate_order_timeline(
+                order_rows, str(self.dashboard_interval.currentData())
+            ))
+            self.dashboard_comparison.set_totals(gross, cost, profit)
+            self.dashboard_items.set_data(aggregate_order_profit(order_rows, "item"))
+            self.dashboard_cities.set_data(aggregate_order_profit(order_rows, "city"))
+            self.dashboard_order_cards.set_rows([
+                {
+                    "label": f"{row['name']} · {row['item_id']} · {row['city']}",
+                    "quantity": row["quantity"],
+                    "gross": row["gross"],
+                    "purchase_cost": row["purchase_cost"],
+                    "fees": int(row["transaction_tax"]) + int(row["setup_fee"]),
+                    "net_profit": row["net_profit"],
+                }
+                for row in recent_orders
+            ])
             self.db_status.setText(
                 f"Items: {items:,}    |    Piaci rekordok: {prices:,}    |    "
                 f"Receptek: {recipes:,}    |    Városok: {cities}"
             )
             self.statusBar().showMessage("Adatbázis állapot frissítve")
         except sqlite3.Error as error:
+            LOGGER.exception("Az adatbázis-állapot nem tölthető be")
             self.statusBar().showMessage(f"Adatbázis-hiba: {error}")
 
     def load_categories(self) -> None:
         """Load the imported hierarchy into the compact category popup."""
 
+        category_rows, counts = self._category_data()
+        self.item_category.set_categories(category_rows, counts)
+        if hasattr(self, "craft_category"):
+            self.craft_category.set_categories(category_rows, counts)
+        if hasattr(self, "flip_category"):
+            self.flip_category.set_categories(category_rows, counts)
+        if hasattr(self, "refining_category"):
+            self.refining_category.set_categories(category_rows, counts)
+
+    @staticmethod
+    def _category_data() -> tuple[list[tuple], dict[tuple[str, ...], int]]:
         counts: dict[tuple[str, ...], int] = {}
         with open_db() as conn:
             category_rows = conn.execute(
@@ -1243,44 +2577,50 @@ class AlbionWindow(QMainWindow):
                 prefix.append(category_id)
                 key = tuple(prefix)
                 counts[key] = counts.get(key, 0) + 1
-        self.item_category.set_categories(category_rows, counts)
-        if hasattr(self, "craft_category"):
-            self.craft_category.set_categories(category_rows, counts)
-        if hasattr(self, "flip_category"):
-            self.flip_category.set_categories(category_rows, counts)
+        return list(category_rows), counts
 
     def selected_category_path(self) -> tuple[str, ...]:
         return self.item_category.selected_path
 
-    def search_items(self) -> None:
-        term = self.item_search.text().strip()
-        predicates = ["tier = ?"]
-        parameters: list[object] = [self.item_tier.value()]
+    @staticmethod
+    def _catalog_item_predicates(
+        alias: str,
+        term: str,
+        tier: int,
+        enchantment: int,
+        category_path: tuple[str, ...],
+    ) -> tuple[list[str], list[object]]:
+        predicates = [f"{alias}.tier = ?"]
+        parameters: list[object] = [tier]
         if term:
             predicates.append(
-                "(name_en LIKE ? COLLATE NOCASE OR uniquename LIKE ? COLLATE NOCASE)"
+                f"({alias}.name_en LIKE ? COLLATE NOCASE OR "
+                f"{alias}.uniquename LIKE ? COLLATE NOCASE)"
             )
             parameters.extend((f"%{term}%", f"%{term}%"))
-        category_columns = (
-            "shopcategory",
-            "shopsubcategory",
-            "shopsubcategory2",
-            "shopsubcategory3",
-        )
         for column, category_id in zip(
-            category_columns, self.selected_category_path(), strict=False
+            ("shopcategory", "shopsubcategory", "shopsubcategory2", "shopsubcategory3"),
+            category_path,
+            strict=False,
         ):
-            predicates.append(f"{column} = ?")
+            predicates.append(f"{alias}.{column} = ?")
             parameters.append(category_id)
-        enchantment = self.item_enchantment.currentData()
         if enchantment >= 0:
-            predicates.append("enchantment = ?")
+            predicates.append(f"{alias}.enchantment = ?")
             parameters.append(enchantment)
+        return predicates, parameters
+
+    def search_items(self) -> None:
+        term = self.item_search.text().strip()
+        enchantment = self.item_enchantment.currentData()
+        predicates, parameters = self._catalog_item_predicates(
+            "i", term, self.item_tier.value(), enchantment, self.selected_category_path()
+        )
         with open_db() as conn:
             rows = conn.execute(
-                f"""SELECT uniquename, name_en, tier, shopcategory, enchantment
-                    FROM items WHERE {' AND '.join(predicates)}
-                    ORDER BY name_en, enchantment, uniquename LIMIT 100""",
+                f"""SELECT i.uniquename, i.name_en, i.tier, i.shopcategory, i.enchantment
+                    FROM items i WHERE {' AND '.join(predicates)}
+                    ORDER BY i.name_en, i.enchantment, i.uniquename LIMIT 100""",
                 parameters,
             ).fetchall()
         self.item_rows = list(rows)
@@ -1440,11 +2780,7 @@ class AlbionWindow(QMainWindow):
             row.buy_price, row.expected_sale_price,
             row.transaction_tax, row.net_profit, f"{row.roi_percent}%",
         ) for row in opportunities]
-        self.fill_table(
-            self.item_table,
-            ["Vétel innen", "Eladás ide", "Q", "Vételár", "Eladási ár", "Adó", "Nettó profit", "ROI"],
-            rows,
-        )
+        self.item_table.set_opportunities(rows, item_id=self.selected_ids[0])
         self.item_detail_results.setCurrentWidget(self.item_table)
 
     def search_recipes(self) -> None:
@@ -1522,13 +2858,18 @@ class AlbionWindow(QMainWindow):
         rows = self.craft_recipe_rows
         current = self.selected_craft_row
         if not rows or current < 0:
-            self.craft_materials.clearContents()
-            self.craft_materials.setRowCount(0)
+            self.craft_materials.set_materials([])
+            self.craft_dependency_tree.set_tree(None)
             return
         recipe_id = rows[current][0]
+        output_id = rows[current][1]
+        output_amount = max(1, int(rows[current][4] or 1))
+        batches = self.craft_batches.value()
         cities = self.craft_cities.selected_cities()
         if not cities:
             self.statusBar().showMessage("Jelölj ki legalább egy crafting/piaci várost.")
+            self.craft_materials.set_materials([])
+            self.craft_dependency_tree.set_tree(None)
             return
         city_placeholders = ",".join("?" for _ in cities)
         with open_db() as conn:
@@ -1553,25 +2894,43 @@ class AlbionWindow(QMainWindow):
                    ORDER BY COALESCE(i.name_en, rm.material_uniquename)""",
                 (*cities, *cities, recipe_id),
             ).fetchall()
-        source = self.craft_source.currentData()
-        display_rows = [
-            (
-                name,
-                unique_name,
-                amount,
-                "Saját farmolás" if source == "farm" else (
-                    f"{price:,}" if price is not None else "N/A"
-                ),
-                city or "N/A",
-                "Igen" if returnable else "Nem",
+            inventory = inventory_quantities(
+                conn, tuple(str(row[0]) for row in materials)
             )
-            for unique_name, name, amount, price, city, returnable in materials
-        ]
-        self.fill_table(
-            self.craft_materials,
-            ["Alapanyag", "Uniquename", "Mennyiség", "Egységár", "Legolcsóbb város", "Visszatérhet"],
-            display_rows,
-        )
+            all_inventory = {
+                str(item_id): int(quantity)
+                for item_id, quantity in conn.execute(
+                    """SELECT item_uniquename, SUM(quantity)
+                       FROM user.inventory GROUP BY item_uniquename"""
+                )
+            }
+        source = self.craft_source.currentData()
+        display_rows = []
+        for unique_name, name, amount, price, city, returnable in materials:
+            required = int(amount) * batches
+            allocation = allocate_inventory(required, inventory.get(str(unique_name), 0))
+            purchase_cost = (
+                int(price) * allocation.missing
+                if source == "buy" and price is not None
+                else 0 if source == "farm" else None
+            )
+            display_rows.append((
+                name, unique_name, required,
+                "Saját farmolás" if source == "farm" else price,
+                city or "N/A", bool(returnable), allocation.available,
+                allocation.used, allocation.missing, purchase_cost,
+            ))
+        self.craft_materials.set_materials(display_rows)
+        with open_db() as conn:
+            tree = build_crafting_dependency_tree(
+                conn,
+                output_id,
+                output_amount * batches,
+                recipe_id=recipe_id,
+                cities=cities,
+                inventory=all_inventory,
+            )
+        self.craft_dependency_tree.set_tree(tree)
 
     def calculate_craft(self) -> None:
         rows = self.craft_recipe_rows
@@ -1585,6 +2944,8 @@ class AlbionWindow(QMainWindow):
         recipe_id, output_id, output_name, _variant_index, output_amount = rows[
             self.selected_craft_row
         ][:5]
+        batches = self.craft_batches.value()
+        output_total = max(1, int(output_amount or 1)) * batches
         cities = self.craft_cities.selected_cities()
         if not cities:
             self.statusBar().showMessage("Jelölj ki legalább egy crafting/piaci várost.")
@@ -1601,11 +2962,22 @@ class AlbionWindow(QMainWindow):
                     WHERE item_uniquename=? AND city IN ({city_placeholders})""",
                 (output_id, *cities),
             ).fetchone()[0]
-            station_cost = self.crafting_price.value()
-            cost = silver + station_cost
+            station_cost = self.crafting_price.value() * batches
+            recipe_cost = int(silver or 0) * batches
+            cost = recipe_cost + station_cost
             missing: list[str] = []
+            inventory_used = 0
+            purchase_cost = 0
+            inventory = inventory_quantities(
+                conn, tuple(str(material_id) for material_id, _amount in materials)
+            )
             if self.craft_source.currentData() == "buy":
                 for material_id, amount in materials:
+                    required = int(amount) * batches
+                    allocation = allocate_inventory(required, inventory.get(str(material_id), 0))
+                    inventory_used += allocation.used
+                    if allocation.missing == 0:
+                        continue
                     price = conn.execute(
                         f"""SELECT MIN(sell_price_min) FROM market_prices
                             WHERE item_uniquename=? AND sell_price_min>0
@@ -1615,46 +2987,53 @@ class AlbionWindow(QMainWindow):
                     if price is None:
                         missing.append(material_id)
                     else:
-                        cost += price * amount
+                        material_cost = int(price) * allocation.missing
+                        purchase_cost += material_cost
+                        cost += material_cost
+            else:
+                for material_id, amount in materials:
+                    required = int(amount) * batches
+                    inventory_used += allocate_inventory(
+                        required, inventory.get(str(material_id), 0)
+                    ).used
         self.show_recipe_materials()
         if missing and self.craft_source.currentData() == "buy":
             self.craft_output.setPlainText(
                 f"{output_name}\nVásárlási profit nem számítható.\n"
                 f"Hiányzó piaci adatok: {', '.join(missing)}\n"
-                f"Farmolási költségalap: {silver + station_cost:,} silver "
-                f"(recept: {silver:,}, állomás: {station_cost:,})"
+                f"Készletből felhasználható: {inventory_used:,} db\n"
+                f"Farmolási költségalap: {recipe_cost + station_cost:,} silver "
+                f"(recept: {recipe_cost:,}, állomás: {station_cost:,})"
             )
             return
         fees = market_fee_policy(self.premium.isChecked())
-        gross_revenue = sale * output_amount if sale is not None else None
+        gross_revenue = sale * output_total if sale is not None else None
         market_tax = fees.transaction_tax(gross_revenue) if gross_revenue is not None else 0
         profit = gross_revenue - market_tax - cost if gross_revenue is not None else None
         self.craft_output.setPlainText(
-            f"{output_name} · output: {output_amount} db\nRecept silver: {silver:,}\n"
-            f"Crafting állomásdíj: {station_cost:,}\nTeljes költség: {cost:,}\n"
+            f"{output_name} · {batches:,} craft kör · output: {output_total:,} db\n"
+            f"Készletből fedezve: {inventory_used:,} alapanyag db\n"
+            f"Piacról beszerzendő anyagok: {purchase_cost:,} silver\n"
+            f"Recept silver: {recipe_cost:,}\nCrafting állomásdíj: {station_cost:,}\n"
+            f"Teljes készpénzköltség: {cost:,}\n"
             f"Bruttó eladási bevétel: {gross_revenue:,}\n"
             f"Fix piaci adó: {market_tax:,}\nNettó profit: {profit:,}"
             if profit is not None else f"{output_name}\nEladási piaci adat nincs."
         )
 
     def search_flip_items(self) -> None:
-        predicates = ["i.tier=?", "EXISTS (SELECT 1 FROM market_prices mp WHERE mp.item_uniquename=i.uniquename)"]
-        parameters: list[object] = [self.flip_tier.value()]
         term = self.flip_search.text().strip()
-        if term:
-            predicates.append("(i.name_en LIKE ? OR i.uniquename LIKE ?)")
-            parameters.extend((f"%{term}%", f"%{term}%"))
-        for column, category_id in zip(
-            ("i.shopcategory", "i.shopsubcategory", "i.shopsubcategory2", "i.shopsubcategory3"),
+        predicates, parameters = self._catalog_item_predicates(
+            "i",
+            term,
+            self.flip_tier.value(),
+            self.flip_enchantment.currentData(),
             self.flip_category.selected_path,
-            strict=False,
-        ):
-            predicates.append(f"{column}=?")
-            parameters.append(category_id)
-        enchantment = self.flip_enchantment.currentData()
-        if enchantment >= 0:
-            predicates.append("i.enchantment=?")
-            parameters.append(enchantment)
+        )
+        predicates.append(
+            "EXISTS (SELECT 1 FROM market_prices mp "
+            "WHERE mp.item_uniquename=i.uniquename)"
+        )
         quality = self.flip_quality.currentData()
         if quality:
             predicates.append("EXISTS (SELECT 1 FROM market_prices q WHERE q.item_uniquename=i.uniquename AND q.quality=?)")
@@ -1758,14 +3137,7 @@ class AlbionWindow(QMainWindow):
             )
             for row in opportunities
         ]
-        self.fill_table(
-            self.global_table,
-            [
-                "Item", "Vétel innen", "Eladás ide", "Q", "Vételár", "Célár",
-                "Adó+díj", "Nettó profit", "ROI", "Adatkor", "Frissességpont",
-            ],
-            rows,
-        )
+        self.global_table.set_opportunities(rows, include_item=True)
         self.statusBar().showMessage(f"{len(rows)} nettó lehetőség betöltve")
 
     @staticmethod
@@ -1841,31 +3213,27 @@ class AlbionWindow(QMainWindow):
             return
 
         def rebuild() -> str:
-            result = subprocess.run(
-                [sys.executable, str(PROJECT_ROOT / "scripts" / "data_sorter.py")],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "Az adatbázis újraépítése sikertelen.")
+            script = PROJECT_ROOT / "scripts" / "data_sorter.py"
+            if not script.exists() or not ITEM_CATALOG_FILE.exists() or not LOCALIZATION_FILE.exists():
+                raise RuntimeError(
+                    "A katalógus újraépítéséhez items.json és localization.json szükséges."
+                )
+            runpy.run_path(str(script), run_name="__main__")
             return "Adatbázis újraépítve."
 
         self.run_background(rebuild, self._done)
 
     def import_crafting_data(self) -> None:
         def import_data() -> str:
-            result = subprocess.run(
-                [sys.executable, str(PROJECT_ROOT / "scripts" / "crafting_importer.py")],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
+            if not ITEM_CATALOG_FILE.exists():
+                raise RuntimeError("A craft importhoz items.json szükséges.")
+            recipes, materials, unresolved = import_crafting_catalog(
+                str(DB_FILE), str(ITEM_CATALOG_FILE)
             )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "A craft import sikertelen.")
-            return "Craft adatok importálva."
+            return (
+                f"Craft adatok importálva: {recipes} recept, {materials} alapanyag, "
+                f"{unresolved} feloldatlan hivatkozás."
+            )
 
         self.run_background(import_data, self._done)
 
@@ -1875,7 +3243,7 @@ class AlbionWindow(QMainWindow):
         def import_categories() -> str:
             with open_db() as conn:
                 category_count, item_count = sync_item_category_data(
-                    conn, PROJECT_ROOT / "items.json"
+                    conn, ITEM_CATALOG_FILE
                 )
             return (
                 f"Kategóriafa frissítve: {category_count} csomópont, "
@@ -1883,6 +3251,44 @@ class AlbionWindow(QMainWindow):
             )
 
         self.run_background(import_categories, self._done)
+
+    def open_log_folder(self) -> None:
+        configure_logging()
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Log mappa megnyitása")
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_DIR))):
+            QMessageBox.warning(
+                self, "Log mappa", f"A mappa nem nyitható meg automatikusan:\n{LOG_DIR}"
+            )
+
+    def export_diagnostics(self) -> None:
+        documents = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        )
+        destination = Path(documents) if documents else LOG_DIR.parent
+        suggested = destination / (
+            f"AlbionPrizeShower-diagnosztika-{datetime.now():%Y%m%d-%H%M%S}.zip"
+        )
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Diagnosztikai csomag mentése",
+            str(suggested),
+            "ZIP archívum (*.zip)",
+        )
+        if not selected:
+            return
+        try:
+            bundle = export_diagnostic_bundle(selected)
+            LOGGER.info("Diagnosztikai csomag elkészült: %s", bundle.name)
+            QMessageBox.information(
+                self,
+                "Diagnosztikai csomag elkészült",
+                f"Ezt a fájlt küldd el a fejlesztőnek:\n{bundle}\n\n"
+                "Személyes adatbázisok nem kerültek a ZIP-be.",
+            )
+        except (OSError, ValueError) as error:
+            LOGGER.exception("A diagnosztikai csomag nem menthető")
+            QMessageBox.critical(self, "Mentési hiba", str(error))
 
     def _done(self, message: str) -> None:
         self.statusBar().showMessage(message)
@@ -1911,11 +3317,15 @@ class AlbionWindow(QMainWindow):
 
 
 def run_gui() -> None:
+    configure_logging()
     app = QApplication.instance() or QApplication(sys.argv)
+    install_qt_message_logging()
+    LOGGER.info("PyQt6 felület indítása")
     app.setFont(QFont("Segoe UI", 10))
     window = AlbionWindow()
     window.show()
-    app.exec()
+    exit_code = app.exec()
+    LOGGER.info("Alkalmazás leállt | exit_code=%s", exit_code)
 
 
 if __name__ == "__main__":

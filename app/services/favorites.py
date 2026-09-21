@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Literal
 
 FavoriteContext = Literal["price", "crafting", "flip"]
 VALID_CONTEXTS = frozenset(("price", "crafting", "flip"))
+LOGGER = logging.getLogger(__name__)
 
 
 def _validate_context(context: str) -> None:
@@ -40,6 +42,12 @@ def set_favorite(
             (context, item_id),
         )
     conn.commit()
+    LOGGER.info(
+        "Kedvenc módosítva | context=%s | item=%s | enabled=%s",
+        context,
+        item_id,
+        enabled,
+    )
 
 
 def toggle_favorite(

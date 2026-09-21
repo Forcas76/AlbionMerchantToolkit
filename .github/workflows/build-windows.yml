@@ -1,0 +1,109 @@
+name: Windows telepítő készítése
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Verziószám (például 1.2.0); üresen automatikus"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Forrás letöltése
+        uses: actions/checkout@v7
+
+      - name: Python beállítása
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Függőségek telepítése
+        run: python -m pip install --upgrade pip -r requirements.txt -r requirements-build.txt
+
+      - name: Automatikus tesztek
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+
+      - name: Verzió meghatározása
+        id: version
+        shell: pwsh
+        run: |
+          $requested = "${{ inputs.version }}".Trim()
+          if ($requested) {
+            $version = $requested.TrimStart('v')
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart('v')
+          } else {
+            $version = "0.0.${{ github.run_number }}"
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "A Windows telepítőhöz numerikus verzió kell: $version"
+          }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "filename=AlbionPrizeShower-Setup-$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Önálló alkalmazás buildelése
+        run: python -m PyInstaller --noconfirm --clean packaging/AlbionPrizeShower.spec
+
+      - name: Build ellenőrzése
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "dist\AlbionPrizeShower\AlbionPrizeShower.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Nem készült el az alkalmazás: $exe"
+          }
+          $catalog = Join-Path $PWD "dist\AlbionPrizeShower\_internal\data\catalog.db"
+          if (-not (Test-Path -LiteralPath $catalog)) {
+            throw "A katalógus-adatbázis nem került a csomagba: $catalog"
+          }
+
+      - name: Windows telepítő fordítása
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "Az Inno Setup fordító nem található." }
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" "/DOutputBaseFilename=${{ steps.version.outputs.filename }}" "packaging\windows-installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Az Inno Setup fordítása sikertelen." }
+
+      - name: Telepítő feltöltése build-artifactként
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.filename }}
+          path: installer-output/${{ steps.version.outputs.filename }}.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Telepítő csatolása a GitHub Release-hez
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "installer-output\${{ steps.version.outputs.filename }}.exe"
+          gh release view "${{ github.ref_name }}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "${{ github.ref_name }}" $asset --clobber
+          } else {
+            gh release create "${{ github.ref_name }}" $asset --generate-notes --title "Albion Prize Shower ${{ steps.version.outputs.value }}"
+          }

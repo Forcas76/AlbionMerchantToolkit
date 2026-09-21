@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import shutil
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 
-from app.paths import CATALOG_DB_FILE, MARKET_DB_FILE, USER_DB_FILE
+from app.paths import (
+    BUNDLED_CATALOG_DB_FILE,
+    CATALOG_DB_FILE,
+    MARKET_DB_FILE,
+    USER_DB_FILE,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 
@@ -20,6 +29,64 @@ class ManagedConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
+
+
+def _ensure_catalog_base_schema(conn: sqlite3.Connection) -> None:
+    """Make a brand-new catalogue database safe to open before its first import."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uniquename TEXT NOT NULL UNIQUE,
+            market_id TEXT,
+            name_en TEXT,
+            item_type TEXT,
+            tier INTEGER,
+            enchantment INTEGER DEFAULT 0,
+            shopcategory TEXT,
+            shopsubcategory TEXT,
+            shopsubcategory2 TEXT,
+            shopsubcategory3 TEXT,
+            slottype TEXT,
+            weight REAL,
+            maxstacksize INTEGER,
+            itemvalue INTEGER,
+            uisprite TEXT,
+            craftable INTEGER DEFAULT 0
+        )
+        """
+    )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    optional_columns = {
+        "market_id": "TEXT",
+        "name_en": "TEXT",
+        "item_type": "TEXT",
+        "tier": "INTEGER",
+        "enchantment": "INTEGER DEFAULT 0",
+        "shopcategory": "TEXT",
+        "shopsubcategory": "TEXT",
+        "shopsubcategory2": "TEXT",
+        "shopsubcategory3": "TEXT",
+        "slottype": "TEXT",
+        "weight": "REAL",
+        "maxstacksize": "INTEGER",
+        "itemvalue": "INTEGER",
+        "uisprite": "TEXT",
+        "craftable": "INTEGER DEFAULT 0",
+    }
+    for column, definition in optional_columns.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE items ADD COLUMN {column} {definition}")
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_items_uniquename ON items(uniquename);
+        CREATE INDEX IF NOT EXISTS idx_items_market_id ON items(market_id);
+        CREATE INDEX IF NOT EXISTS idx_items_type ON items(item_type);
+        CREATE INDEX IF NOT EXISTS idx_items_tier ON items(tier);
+        CREATE INDEX IF NOT EXISTS idx_items_category ON items(shopcategory);
+        """
+    )
 
 
 def _migration_001_market_history(conn: sqlite3.Connection) -> None:
@@ -350,6 +417,100 @@ USER_MIGRATIONS: tuple[Migration, ...] = (
 )
 
 
+def _migration_002_inventory(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS inventory (
+            item_uniquename TEXT PRIMARY KEY,
+            quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_inventory_updated
+            ON inventory(updated_at DESC);
+        """
+    )
+
+
+USER_MIGRATIONS = USER_MIGRATIONS + (
+    (2, "personal inventory", _migration_002_inventory),
+)
+
+
+def _migration_003_inventory_quality(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(inventory)")}
+    if not columns or "quality" in columns:
+        return
+    conn.executescript(
+        """
+        ALTER TABLE inventory RENAME TO inventory_legacy;
+        CREATE TABLE inventory (
+            item_uniquename TEXT NOT NULL,
+            quality INTEGER NOT NULL DEFAULT 1 CHECK(quality BETWEEN 1 AND 5),
+            quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(item_uniquename, quality)
+        );
+        INSERT INTO inventory(item_uniquename, quality, quantity, updated_at)
+        SELECT item_uniquename, 1, quantity, updated_at FROM inventory_legacy;
+        DROP TABLE inventory_legacy;
+        CREATE INDEX idx_inventory_updated ON inventory(updated_at DESC);
+        """
+    )
+
+
+USER_MIGRATIONS = USER_MIGRATIONS + (
+    (3, "quality-aware personal inventory", _migration_003_inventory_quality),
+)
+
+
+def _migration_004_trade_orders(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS trade_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft'
+                CHECK(status IN ('draft', 'active', 'closed')),
+            output_item_uniquename TEXT NOT NULL,
+            output_quality INTEGER NOT NULL DEFAULT 1 CHECK(output_quality BETWEEN 1 AND 5),
+            output_quantity INTEGER NOT NULL CHECK(output_quantity > 0),
+            sold_quantity INTEGER NOT NULL DEFAULT 0 CHECK(sold_quantity >= 0),
+            planned_unit_price INTEGER NOT NULL DEFAULT 0 CHECK(planned_unit_price >= 0),
+            actual_unit_price INTEGER CHECK(actual_unit_price >= 0),
+            sale_city TEXT NOT NULL,
+            sale_method TEXT NOT NULL DEFAULT 'sell_order'
+                CHECK(sale_method IN ('sell_order', 'instant')),
+            premium INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            activated_at TEXT,
+            closed_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_trade_orders_status_date
+            ON trade_orders(status, closed_at DESC, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS trade_order_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL REFERENCES trade_orders(id) ON DELETE CASCADE,
+            item_uniquename TEXT NOT NULL,
+            quality INTEGER NOT NULL DEFAULT 1 CHECK(quality BETWEEN 1 AND 5),
+            purchased_quantity INTEGER NOT NULL DEFAULT 0 CHECK(purchased_quantity >= 0),
+            inventory_quantity INTEGER NOT NULL DEFAULT 0 CHECK(inventory_quantity >= 0),
+            purchased_unit_price INTEGER NOT NULL DEFAULT 0 CHECK(purchased_unit_price >= 0),
+            purchase_city TEXT NOT NULL,
+            CHECK(purchased_quantity > 0 OR inventory_quantity > 0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trade_order_materials_order
+            ON trade_order_materials(order_id);
+        """
+    )
+
+
+USER_MIGRATIONS = USER_MIGRATIONS + (
+    (4, "trade order journal", _migration_004_trade_orders),
+)
+
+
 def _apply_migration_set(
     conn: sqlite3.Connection,
     migrations: tuple[Migration, ...],
@@ -425,16 +586,40 @@ def connect_database(
     for db_path in (catalog, market, user):
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Installed builds keep the shipped catalogue read-only beside the
+    # executable and copy it into the current user's writable AppData on the
+    # first launch. Market and personal data are always created there.
+    bundled_catalog = BUNDLED_CATALOG_DB_FILE
+    is_default_catalog = catalog.resolve() == Path(CATALOG_DB_FILE).resolve()
+    is_separate_bundle = (
+        bundled_catalog.exists() and bundled_catalog.resolve() != catalog.resolve()
+    )
+    bundle_is_newer = is_separate_bundle and (
+        not catalog.exists()
+        or bundled_catalog.stat().st_mtime_ns > catalog.stat().st_mtime_ns
+    )
+    if is_default_catalog and is_separate_bundle and bundle_is_newer:
+        shutil.copy2(bundled_catalog, catalog)
+        LOGGER.info("Beépített katalógus telepítve/frissítve: %s", catalog.name)
+
     with closing(sqlite3.connect(str(catalog))) as schema_conn:
         with schema_conn:
             schema_conn.execute("PRAGMA foreign_keys = ON")
-            apply_catalog_migrations(schema_conn)
+            _ensure_catalog_base_schema(schema_conn)
+            catalog_migrations = apply_catalog_migrations(schema_conn)
     with closing(sqlite3.connect(str(market))) as schema_conn:
         with schema_conn:
-            apply_market_migrations(schema_conn)
+            market_migrations = apply_market_migrations(schema_conn)
     with closing(sqlite3.connect(str(user))) as schema_conn:
         with schema_conn:
-            apply_user_migrations(schema_conn)
+            user_migrations = apply_user_migrations(schema_conn)
+
+    if catalog_migrations or market_migrations or user_migrations:
+        LOGGER.info(
+            "Adatbázis-migrációk | catalog=%s market=%s user=%s",
+            catalog_migrations, market_migrations, user_migrations,
+        )
+    LOGGER.debug("Adatbázis megnyitása: %s", catalog.name)
 
     conn = sqlite3.connect(str(catalog), factory=ManagedConnection)
     conn.execute("PRAGMA foreign_keys = ON")

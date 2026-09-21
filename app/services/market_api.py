@@ -7,6 +7,7 @@ snapshot per item, city, quality and enchantment combination.
 from __future__ import annotations
 
 import argparse
+import logging
 import sqlite3
 import time
 from collections import deque
@@ -17,6 +18,8 @@ from urllib.parse import urlencode
 import requests
 
 from app.paths import CATALOG_DB_FILE
+
+LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://europe.albion-online-data.com/api/v2/stats/prices"
 MAX_URL_LEN = 4000
@@ -111,7 +114,8 @@ def fetch_prices_for_chunk(
     session: requests.Session | None = None,
     locations: Iterable[str] = CITIES,
 ) -> list[dict[str, Any]]:
-    url = _request_url(item_ids, locations)
+    location_list = tuple(locations)
+    url = _request_url(item_ids, location_list)
     if len(url) > MAX_URL_LEN:
         raise ValueError(f"Request URL is {len(url)} characters; limit is {MAX_URL_LEN}")
     limiter = rate_limiter or ApiRateLimiter()
@@ -122,6 +126,10 @@ def fetch_prices_for_chunk(
     })
     for attempt in range(retries):
         try:
+            LOGGER.debug(
+                "Piaci API kérés | itemek=%s városok=%s próbálkozás=%s/%s",
+                len(item_ids), location_list, attempt + 1, retries,
+            )
             limiter.wait_for_slot()
             response = http.get(url, timeout=60)
             if response.status_code == 429:
@@ -137,6 +145,10 @@ def fetch_prices_for_chunk(
                 raise ValueError("The market API returned a non-list JSON payload")
             return payload
         except (requests.RequestException, ValueError):
+            LOGGER.warning(
+                "Piaci API kérés sikertelen | próbálkozás=%s/%s",
+                attempt + 1, retries, exc_info=attempt == retries - 1,
+            )
             if attempt == retries - 1:
                 raise
             time.sleep(initial_wait * (2 ** attempt))
@@ -231,6 +243,10 @@ def do_fetch(
     limiter = ApiRateLimiter()
     session = requests.Session()
     chunks = chunk_ids(ids, locations=location_list)
+    LOGGER.info(
+        "Teljes piaci frissítés indul | itemek=%s csomagok=%s városok=%s",
+        len(ids), len(chunks), location_list,
+    )
     chunk_count = len(chunks)
     if progress_callback:
         progress_callback(0, chunk_count, "API-frissítés előkészítve")
@@ -243,7 +259,10 @@ def do_fetch(
                 locations=location_list,
             )
             total += save_prices(conn, prices)
-            print(f"[{number}] {len(prices)} API rekord, {total} mentve")
+            LOGGER.debug(
+                "Piaci csomag kész | %s/%s api_rekord=%s mentve_összesen=%s",
+                number, chunk_count, len(prices), total,
+            )
             if progress_callback:
                 progress_callback(
                     number,
@@ -252,6 +271,7 @@ def do_fetch(
                 )
     finally:
         session.close()
+    LOGGER.info("Teljes piaci frissítés kész | mentett rekordok=%s", total)
     return total
 
 
