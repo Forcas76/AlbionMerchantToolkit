@@ -15,6 +15,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from app.paths import CATALOG_DB_FILE, FROZEN, LOG_DIR, MARKET_DB_FILE, USER_DB_FILE
+from app.version import RELEASE_CHANNEL, __version__
 
 LOG_FILE = LOG_DIR / "albion-merchant-toolkit.log"
 FAULT_FILE = LOG_DIR / "native-crash.log"
@@ -81,8 +82,10 @@ def configure_logging() -> Path:
 
     _configured = True
     logging.getLogger("app").info(
-        "Alkalmazás indul | python=%s | platform=%s | frozen=%s | pid=%s",
-        platform.python_version(), platform.platform(), FROZEN, os.getpid(),
+        "Alkalmazás indul | version=%s | channel=%s | python=%s | platform=%s | "
+        "frozen=%s | pid=%s",
+        __version__, RELEASE_CHANNEL, platform.python_version(), platform.platform(),
+        FROZEN, os.getpid(),
     )
     logging.getLogger("app").info(
         "Adatkönyvtár előkészítve | mód=%s",
@@ -145,6 +148,8 @@ def export_diagnostic_bundle(destination: str | Path) -> Path:
         _fault_stream.flush()
     summary = [
         f"created_utc={datetime.now(timezone.utc).isoformat()}",
+        f"app_version={__version__}",
+        f"release_channel={RELEASE_CHANNEL}",
         f"python={platform.python_version()}",
         f"platform={platform.platform()}",
         f"frozen={FROZEN}",

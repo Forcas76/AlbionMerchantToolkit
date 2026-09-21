@@ -1,5 +1,35 @@
 # Albion Merchant Toolkit
 
+<p align="center">
+  <img src="assets/branding/AlbionMerchantToolkit.png" alt="Albion Merchant Toolkit" width="720">
+</p>
+
+> Aktuális verzió: **0.1.0-alpha.1 · Alpha**<br>
+> Korai fejlesztői kiadás: hibák, hiányzó funkciók és változó adatstruktúrák
+> előfordulhatnak.
+
+## Verziókezelés
+
+A teljes projekt egyetlen verzióforrása a gyökérkönyvtárban található
+[`VERSION`](VERSION) fájl. Verzióváltáskor kizárólag ennek az egysoros fájlnak
+az értékét kell módosítani, például:
+
+```text
+0.1.0-alpha.1
+```
+
+Ebből az értékből készül automatikusan:
+
+- az alkalmazás ablakcíme, oldalsávja, státuszsora és Névjegy ablaka;
+- a napló és a diagnosztikai ZIP verzióadata;
+- az API-kérések User-Agent verziója;
+- a Windows EXE fájl- és termékverziója;
+- a telepítő verziója és fájlneve;
+- a GitHub Actions build artifact és Release neve.
+
+A kiadási csatornát a verzió előtagja határozza meg. Az `-alpha` jelölés miatt
+a felület mindenhol **Alpha** állapotot jelenít meg.
+
 Az Albion Merchant Toolkit egy magyar nyelvű, közösségi Albion Online
 piacelemző és kereskedéstámogató asztali alkalmazás. Segít áttekinteni a
 városi árakat, felkutatni a kereskedési lehetőségeket, kiszámolni a crafting

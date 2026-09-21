@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.version import APP_USER_AGENT
+
 
 def item_icon_url(uniquename: str, quality: int = 1, size: int = 128) -> str:
     """Return a plain Albion render API URL, never Markdown-formatted text."""
@@ -75,7 +77,7 @@ class ItemIconLoader(QNetworkAccessManager):
             return
         self._waiting[url] = [callback]
         request = QNetworkRequest(QUrl(url))
-        request.setRawHeader(b"User-Agent", b"AlbionMerchantToolkit/1.0")
+        request.setRawHeader(b"User-Agent", APP_USER_AGENT.encode("ascii"))
         reply = self.get(request)
 
         def finished() -> None:

@@ -5,11 +5,6 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Verziószám (például 1.2.0); üresen automatikus"
-        required: false
-        type: string
 
 permissions:
   contents: write
@@ -45,18 +40,26 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $requested = "${{ inputs.version }}".Trim()
-          if ($requested) {
-            $version = $requested.TrimStart('v')
-          } elseif ("${{ github.ref_type }}" -eq "tag") {
-            $version = "${{ github.ref_name }}".TrimStart('v')
-          } else {
-            $version = "0.0.${{ github.run_number }}"
+          $version = (Get-Content -LiteralPath "VERSION" -Raw).Trim()
+          if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+            throw "Érvénytelen szemantikus verzió a VERSION fájlban: $version"
           }
-          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
-            throw "A Windows telepítőhöz numerikus verzió kell: $version"
+          $major = $Matches[1]
+          $minor = $Matches[2]
+          $patch = $Matches[3]
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$version") {
+            throw "A tag neve legyen pontosan v$version, hogy egyezzen a VERSION fájllal."
           }
+          $serial = 0
+          if ($version -match '-[^+]*[.-](\d+)(?:\+.*)?$') { $serial = [int]$Matches[1] }
+          $numeric = "$major.$minor.$patch.$serial"
+          $channel = "Stable"
+          if ($version -match '-alpha') { $channel = "Alpha" }
+          elseif ($version -match '-beta') { $channel = "Beta" }
+          elseif ($version -match '-rc') { $channel = "Release Candidate" }
           "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "numeric=$numeric" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "channel=$channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "filename=AlbionMerchantToolkit-Setup-$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Önálló alkalmazás buildelése
@@ -83,7 +86,7 @@ jobs:
           )
           $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $iscc) { throw "Az Inno Setup fordító nem található." }
-          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" "/DOutputBaseFilename=${{ steps.version.outputs.filename }}" "packaging\windows-installer.iss"
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" "/DMyAppNumericVersion=${{ steps.version.outputs.numeric }}" "/DMyAppChannel=${{ steps.version.outputs.channel }}" "/DOutputBaseFilename=${{ steps.version.outputs.filename }}" "packaging\windows-installer.iss"
           if ($LASTEXITCODE -ne 0) { throw "Az Inno Setup fordítása sikertelen." }
 
       - name: Telepítő feltöltése build-artifactként
@@ -105,5 +108,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload "${{ github.ref_name }}" $asset --clobber
           } else {
-            gh release create "${{ github.ref_name }}" $asset --generate-notes --title "Albion Merchant Toolkit ${{ steps.version.outputs.value }}"
+            gh release create "${{ github.ref_name }}" $asset --generate-notes --title "Albion Merchant Toolkit ${{ steps.version.outputs.value }} (${{ steps.version.outputs.channel }})"
           }

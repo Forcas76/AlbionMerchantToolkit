@@ -9,12 +9,13 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from app.core.database import connect_database
 from app.paths import CATALOG_DB_FILE
 from app.services.market_api import save_prices
 from app.ui import qt_app
+from app.version import VERSION_LABEL
 
 
 class WindowSmokeTests(unittest.TestCase):
@@ -57,7 +58,11 @@ class WindowSmokeTests(unittest.TestCase):
         window = qt_app.AlbionWindow()
         self.app.processEvents()
         self.assertEqual(window.pages.count(), 10)
+        self.assertIn(VERSION_LABEL, window.windowTitle())
         self.assertTrue(window.item_splitter.childrenCollapsible() is False)
+        brand = window.findChild(QLabel, "brand")
+        self.assertIsNotNone(brand)
+        self.assertFalse(brand.pixmap().isNull())
         with qt_app.open_db() as conn:
             self.assertEqual(
                 conn.execute(

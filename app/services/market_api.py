@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 import requests
 
 from app.paths import CATALOG_DB_FILE
+from app.version import APP_USER_AGENT
 
 LOGGER = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ def fetch_prices_for_chunk(
     http = session or requests.Session()
     http.headers.update({
         "Accept-Encoding": "gzip",
-        "User-Agent": "AlbionMerchantToolkit/1.0",
+        "User-Agent": APP_USER_AGENT,
     })
     for attempt in range(retries):
         try:

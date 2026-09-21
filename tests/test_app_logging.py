@@ -35,6 +35,8 @@ class DiagnosticBundleTests(unittest.TestCase):
             self.assertFalse(any(name.endswith(".db") for name in names))
             self.assertNotIn(str(root), summary)
             self.assertIn("executable_name=", summary)
+            self.assertIn(f"app_version={app_logging.__version__}", summary)
+            self.assertIn("release_channel=Alpha", summary)
 
 
 if __name__ == "__main__":

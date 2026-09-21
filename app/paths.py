@@ -27,6 +27,9 @@ else:
 
 BUNDLED_DATA_DIR = BUNDLE_ROOT / "data"
 BUNDLED_CATALOG_DB_FILE = BUNDLED_DATA_DIR / "catalog.db"
+BRANDING_DIR = BUNDLE_ROOT / "assets" / "branding"
+APP_ICON_FILE = BRANDING_DIR / "AlbionMerchantToolkit_icon.png"
+APP_LOGO_FILE = BRANDING_DIR / "AlbionMerchantToolkit.png"
 LOG_DIR = DATA_DIR.parent / "logs"
 LEGACY_DB_FILE = DATA_DIR / "albion.db"
 CATALOG_DB_FILE = DATA_DIR / "catalog.db"

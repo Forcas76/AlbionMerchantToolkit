@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 import requests
 
 from app.services.market_api import ApiRateLimiter, CITIES, MAX_URL_LEN
+from app.version import APP_USER_AGENT
 
 BASE_URL = "https://europe.albion-online-data.com/api/v2/stats/history"
 
@@ -61,7 +62,7 @@ def fetch_history(
     http = session or requests.Session()
     http.headers.update({
         "Accept-Encoding": "gzip",
-        "User-Agent": "AlbionMerchantToolkit/1.0",
+        "User-Agent": APP_USER_AGENT,
     })
     limiter = rate_limiter or ApiRateLimiter()
     try:

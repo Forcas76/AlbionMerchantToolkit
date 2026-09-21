@@ -1,5 +1,11 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.0-local"
+  #error A MyAppVersion parameter kötelező; forrása a gyökér VERSION fájl.
+#endif
+#ifndef MyAppNumericVersion
+  #error A MyAppNumericVersion parameter kötelező; forrása a gyökér VERSION fájl.
+#endif
+#ifndef MyAppChannel
+  #error A MyAppChannel parameter kötelező; forrása a gyökér VERSION fájl.
 #endif
 #ifndef OutputBaseFilename
   #define OutputBaseFilename "AlbionMerchantToolkit-Setup"
@@ -13,6 +19,7 @@
 AppId={{7CB17B6A-4F1F-47CF-A86B-3AE0580D2282}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion} ({#MyAppChannel})
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\Albion Merchant Toolkit
 DefaultGroupName={#MyAppName}
@@ -28,11 +35,12 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 UninstallDisplayIcon={app}\{#MyAppExeName}
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppNumericVersion}
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription={#MyAppName} telepítő
+VersionInfoDescription={#MyAppName} {#MyAppVersion} {#MyAppChannel} telepítő
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
+SetupIconFile=..\assets\branding\AlbionMerchantToolkit_icon.ico
 
 [Languages]
 Name: "hungarian"; MessagesFile: "compiler:Languages\Hungarian.isl"

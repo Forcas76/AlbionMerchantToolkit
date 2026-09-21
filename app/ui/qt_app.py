@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from PyQt6.QtCore import QEasingCurve, QObject, QStandardPaths, QThread, QTimer, Qt, QUrl, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QAction, QDesktopServices, QFont
+from PyQt6.QtGui import QAction, QDesktopServices, QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -80,12 +80,15 @@ from app.core.app_logging import (
     install_qt_message_logging,
 )
 from app.paths import (
+    APP_ICON_FILE,
+    APP_LOGO_FILE,
     ITEMS_FILE as ITEM_CATALOG_FILE,
     LOCALIZATION_FILE,
     PRODUCT_ID,
     PRODUCT_NAME,
     PROJECT_ROOT,
 )
+from app.version import VERSION_LABEL, __version__
 from app.services.inventory import (
     allocate_inventory,
     get_quantity as get_inventory_quantity,
@@ -407,7 +410,8 @@ class ItemPriceWindow(QDialog):
 class AlbionWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(PRODUCT_NAME)
+        self.setWindowTitle(f"{PRODUCT_NAME} — {VERSION_LABEL}")
+        self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
         self.resize(1440, 900)
         self.setMinimumSize(1050, 700)
         self.selected_ids: list[str] = []
@@ -439,7 +443,22 @@ class AlbionWindow(QMainWindow):
     def _setup_actions(self) -> None:
         self.exit_action = QAction("Kilépés", self)
         self.exit_action.triggered.connect(self.close)
-        self.menuBar().addMenu(PRODUCT_NAME).addAction(self.exit_action)
+        about_action = QAction(f"Névjegy · {VERSION_LABEL}", self)
+        about_action.triggered.connect(self.show_about)
+        application_menu = self.menuBar().addMenu(PRODUCT_NAME)
+        application_menu.addAction(about_action)
+        application_menu.addSeparator()
+        application_menu.addAction(self.exit_action)
+
+    def show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"{PRODUCT_NAME} – Névjegy",
+            f"<h2>{PRODUCT_NAME}</h2>"
+            f"<p><b>{VERSION_LABEL}</b></p>"
+            "<p>Albion Online piaci, crafting, refining és inventory eszköztár.</p>"
+            "<p>Ez egy korai Alpha-verzió; hibák és hiányzó funkciók előfordulhatnak.</p>",
+        )
 
     def _build_shell(self) -> None:
         root = QWidget()
@@ -454,11 +473,25 @@ class AlbionWindow(QMainWindow):
         sidebar_layout.setContentsMargins(18, 24, 18, 18)
         sidebar_layout.setSpacing(8)
 
-        brand = QLabel("ALBION\nMERCHANT TOOLKIT")
+        brand = QLabel()
         brand.setObjectName("brand")
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand_image = QPixmap(str(APP_LOGO_FILE))
+        if brand_image.isNull():
+            brand.setText("ALBION\nMERCHANT TOOLKIT")
+        else:
+            brand.setPixmap(
+                brand_image.scaled(
+                    212,
+                    159,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
         sidebar_layout.addWidget(brand)
-        subtitle = QLabel("Market intelligence")
+        subtitle = QLabel(f"Market intelligence\n{VERSION_LABEL}")
         subtitle.setObjectName("sidebarSubtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sidebar_layout.addWidget(subtitle)
         sidebar_layout.addSpacing(24)
 
@@ -499,6 +532,9 @@ class AlbionWindow(QMainWindow):
         shell.addWidget(self.pages, 1)
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
+        version_status = QLabel(VERSION_LABEL)
+        version_status.setObjectName("versionStatus")
+        self.statusBar().addPermanentWidget(version_status)
         self.statusBar().showMessage("Készen áll")
         self.show_dashboard()
 
@@ -3327,7 +3363,9 @@ def run_gui() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(PRODUCT_ID)
     app.setApplicationDisplayName(PRODUCT_NAME)
+    app.setApplicationVersion(__version__)
     app.setOrganizationName(PRODUCT_NAME)
+    app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     install_qt_message_logging()
     LOGGER.info("PyQt6 felület indítása")
     app.setFont(QFont("Segoe UI", 10))
