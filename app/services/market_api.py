@@ -122,7 +122,7 @@ def fetch_prices_for_chunk(
     http = session or requests.Session()
     http.headers.update({
         "Accept-Encoding": "gzip",
-        "User-Agent": "AlbionPrizeShower/1.0",
+        "User-Agent": "AlbionMerchantToolkit/1.0",
     })
     for attempt in range(retries):
         try:

@@ -61,7 +61,7 @@ def fetch_history(
     http = session or requests.Session()
     http.headers.update({
         "Accept-Encoding": "gzip",
-        "User-Agent": "AlbionPrizeShower/1.0",
+        "User-Agent": "AlbionMerchantToolkit/1.0",
     })
     limiter = rate_limiter or ApiRateLimiter()
     try:

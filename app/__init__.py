@@ -1,1 +1,1 @@
-"""Albion Prize Shower application package."""
+"""Albion Merchant Toolkit application package."""

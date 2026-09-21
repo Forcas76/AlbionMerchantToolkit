@@ -57,19 +57,19 @@ jobs:
             throw "A Windows telepítőhöz numerikus verzió kell: $version"
           }
           "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "filename=AlbionPrizeShower-Setup-$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "filename=AlbionMerchantToolkit-Setup-$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Önálló alkalmazás buildelése
-        run: python -m PyInstaller --noconfirm --clean packaging/AlbionPrizeShower.spec
+        run: python -m PyInstaller --noconfirm --clean packaging/AlbionMerchantToolkit.spec
 
       - name: Build ellenőrzése
         shell: pwsh
         run: |
-          $exe = Join-Path $PWD "dist\AlbionPrizeShower\AlbionPrizeShower.exe"
+          $exe = Join-Path $PWD "dist\AlbionMerchantToolkit\AlbionMerchantToolkit.exe"
           if (-not (Test-Path -LiteralPath $exe)) {
             throw "Nem készült el az alkalmazás: $exe"
           }
-          $catalog = Join-Path $PWD "dist\AlbionPrizeShower\_internal\data\catalog.db"
+          $catalog = Join-Path $PWD "dist\AlbionMerchantToolkit\_internal\data\catalog.db"
           if (-not (Test-Path -LiteralPath $catalog)) {
             throw "A katalógus-adatbázis nem került a csomagba: $catalog"
           }
@@ -105,5 +105,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload "${{ github.ref_name }}" $asset --clobber
           } else {
-            gh release create "${{ github.ref_name }}" $asset --generate-notes --title "Albion Prize Shower ${{ steps.version.outputs.value }}"
+            gh release create "${{ github.ref_name }}" $asset --generate-notes --title "Albion Merchant Toolkit ${{ steps.version.outputs.value }}"
           }

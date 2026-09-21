@@ -14,6 +14,7 @@ from app.paths import (
     CATALOG_DB_FILE,
     MARKET_DB_FILE,
     USER_DB_FILE,
+    migrate_legacy_data_directory,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -581,6 +582,8 @@ def connect_database(
     """Open the catalogue and attach volatile market and private user stores."""
 
     catalog = Path(path)
+    if catalog.resolve() == Path(CATALOG_DB_FILE).resolve():
+        migrate_legacy_data_directory()
     market = Path(market_path)
     user = Path(user_path)
     for db_path in (catalog, market, user):

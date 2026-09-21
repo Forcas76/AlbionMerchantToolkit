@@ -16,7 +16,7 @@ from pathlib import Path
 
 from app.paths import CATALOG_DB_FILE, FROZEN, LOG_DIR, MARKET_DB_FILE, USER_DB_FILE
 
-LOG_FILE = LOG_DIR / "albion-prize-shower.log"
+LOG_FILE = LOG_DIR / "albion-merchant-toolkit.log"
 FAULT_FILE = LOG_DIR / "native-crash.log"
 _configured = False
 _fault_stream = None

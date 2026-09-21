@@ -15,7 +15,7 @@ class DiagnosticBundleTests(unittest.TestCase):
             root = Path(directory)
             log_dir = root / "logs"
             log_dir.mkdir()
-            (log_dir / "albion-prize-shower.log").write_text(
+            (log_dir / "albion-merchant-toolkit.log").write_text(
                 "teszt napló\n", encoding="utf-8"
             )
             destination = root / "diagnostics.zip"
@@ -31,7 +31,7 @@ class DiagnosticBundleTests(unittest.TestCase):
                 names = set(archive.namelist())
                 summary = archive.read("diagnostics.txt").decode("utf-8")
 
-            self.assertIn("logs/albion-prize-shower.log", names)
+            self.assertIn("logs/albion-merchant-toolkit.log", names)
             self.assertFalse(any(name.endswith(".db") for name in names))
             self.assertNotIn(str(root), summary)
             self.assertIn("executable_name=", summary)

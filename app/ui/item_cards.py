@@ -75,7 +75,7 @@ class ItemIconLoader(QNetworkAccessManager):
             return
         self._waiting[url] = [callback]
         request = QNetworkRequest(QUrl(url))
-        request.setRawHeader(b"User-Agent", b"AlbionPrizeShower/1.0")
+        request.setRawHeader(b"User-Agent", b"AlbionMerchantToolkit/1.0")
         reply = self.get(request)
 
         def finished() -> None:

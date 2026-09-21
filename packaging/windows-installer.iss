@@ -2,19 +2,19 @@
   #define MyAppVersion "0.0.0-local"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "AlbionPrizeShower-Setup"
+  #define OutputBaseFilename "AlbionMerchantToolkit-Setup"
 #endif
 
-#define MyAppName "Albion Prize Shower"
-#define MyAppPublisher "Albion Prize Shower"
-#define MyAppExeName "AlbionPrizeShower.exe"
+#define MyAppName "Albion Merchant Toolkit"
+#define MyAppPublisher "Albion Merchant Toolkit"
+#define MyAppExeName "AlbionMerchantToolkit.exe"
 
 [Setup]
 AppId={{7CB17B6A-4F1F-47CF-A86B-3AE0580D2282}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\Albion Prize Shower
+DefaultDirName={localappdata}\Programs\Albion Merchant Toolkit
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -39,7 +39,10 @@ Name: "hungarian"; MessagesFile: "compiler:Languages\Hungarian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "..\dist\AlbionPrizeShower\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\AlbionMerchantToolkit\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+Type: files; Name: "{app}\AlbionPrizeShower.exe"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

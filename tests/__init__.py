@@ -1,1 +1,1 @@
-"""Automated tests for Albion Prize Shower."""
+"""Automated tests for Albion Merchant Toolkit."""

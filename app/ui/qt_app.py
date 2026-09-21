@@ -1,4 +1,4 @@
-"""Modern PyQt6 interface for Albion Prize Shower."""
+"""Modern PyQt6 interface for Albion Merchant Toolkit."""
 
 from __future__ import annotations
 
@@ -79,7 +79,13 @@ from app.core.app_logging import (
     export_diagnostic_bundle,
     install_qt_message_logging,
 )
-from app.paths import ITEMS_FILE as ITEM_CATALOG_FILE, LOCALIZATION_FILE, PROJECT_ROOT
+from app.paths import (
+    ITEMS_FILE as ITEM_CATALOG_FILE,
+    LOCALIZATION_FILE,
+    PRODUCT_ID,
+    PRODUCT_NAME,
+    PROJECT_ROOT,
+)
 from app.services.inventory import (
     allocate_inventory,
     get_quantity as get_inventory_quantity,
@@ -401,7 +407,7 @@ class ItemPriceWindow(QDialog):
 class AlbionWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Albion Prize Shower")
+        self.setWindowTitle(PRODUCT_NAME)
         self.resize(1440, 900)
         self.setMinimumSize(1050, 700)
         self.selected_ids: list[str] = []
@@ -433,7 +439,7 @@ class AlbionWindow(QMainWindow):
     def _setup_actions(self) -> None:
         self.exit_action = QAction("Kilépés", self)
         self.exit_action.triggered.connect(self.close)
-        self.menuBar().addMenu("Albion Prize Shower").addAction(self.exit_action)
+        self.menuBar().addMenu(PRODUCT_NAME).addAction(self.exit_action)
 
     def _build_shell(self) -> None:
         root = QWidget()
@@ -448,7 +454,7 @@ class AlbionWindow(QMainWindow):
         sidebar_layout.setContentsMargins(18, 24, 18, 18)
         sidebar_layout.setSpacing(8)
 
-        brand = QLabel("ALBION\nPRIZE SHOWER")
+        brand = QLabel("ALBION\nMERCHANT TOOLKIT")
         brand.setObjectName("brand")
         sidebar_layout.addWidget(brand)
         subtitle = QLabel("Market intelligence")
@@ -3267,7 +3273,7 @@ class AlbionWindow(QMainWindow):
         )
         destination = Path(documents) if documents else LOG_DIR.parent
         suggested = destination / (
-            f"AlbionPrizeShower-diagnosztika-{datetime.now():%Y%m%d-%H%M%S}.zip"
+            f"{PRODUCT_ID}-diagnosztika-{datetime.now():%Y%m%d-%H%M%S}.zip"
         )
         selected, _filter = QFileDialog.getSaveFileName(
             self,
@@ -3319,6 +3325,9 @@ class AlbionWindow(QMainWindow):
 def run_gui() -> None:
     configure_logging()
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName(PRODUCT_ID)
+    app.setApplicationDisplayName(PRODUCT_NAME)
+    app.setOrganizationName(PRODUCT_NAME)
     install_qt_message_logging()
     LOGGER.info("PyQt6 felület indítása")
     app.setFont(QFont("Segoe UI", 10))

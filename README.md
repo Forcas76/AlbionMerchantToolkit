@@ -1,6 +1,6 @@
-# Albion Prize Shower
+# Albion Merchant Toolkit
 
-Az Albion Prize Shower egy magyar nyelvű, közösségi Albion Online
+Az Albion Merchant Toolkit egy magyar nyelvű, közösségi Albion Online
 piacelemző és kereskedéstámogató asztali alkalmazás. Segít áttekinteni a
 városi árakat, felkutatni a kereskedési lehetőségeket, kiszámolni a crafting
 és refining költségeit, valamint nyilvántartani a készletet és a lezárt
@@ -28,7 +28,7 @@ kereskedési projekteket.
 ## Telepítés Windowsra
 
 A GitHub Releases oldalról töltsd le az aktuális
-`AlbionPrizeShower-Setup-<verzió>.exe` fájlt, majd indítsd el a telepítőt.
+`AlbionMerchantToolkit-Setup-<verzió>.exe` fájlt, majd indítsd el a telepítőt.
 
 A telepíthető kiadás tartalmazza:
 
@@ -49,7 +49,7 @@ A telepített program nem a védett telepítési könyvtárba ír. A személyes 
 folyamatosan változó adatbázisokat itt tárolja:
 
 ```text
-%LOCALAPPDATA%\AlbionPrizeShower\data
+%LOCALAPPDATA%\AlbionMerchantToolkit\data
 ```
 
 Itt található többek között:
@@ -63,6 +63,11 @@ automatikusan törlésre. Ha az új telepítő frissebb beépített katalógust
 tartalmaz, a `catalog.db` frissül, miközben a `market.db` és `user.db`
 érintetlen marad.
 
+A program korábbi, **Albion Prize Shower** nevű változatáról történő első
+indításkor a meglévő `%LOCALAPPDATA%\AlbionPrizeShower\data` tartalmát
+automatikusan átmásolja az új adatmappába. Az eredeti könyvtár biztonsági
+másolatként megmarad.
+
 ## Hibajelentés és naplók
 
 A program forgó naplófájlba rögzíti az indulást, a háttérműveleteket, az
@@ -70,7 +75,7 @@ adatfrissítéseket és a hibák részletes nyomát. Telepített verzióban a na
 találhatók:
 
 ```text
-%LOCALAPPDATA%\AlbionPrizeShower\logs
+%LOCALAPPDATA%\AlbionMerchantToolkit\logs
 ```
 
 Az **Adatközpont → Diagnosztikai ZIP mentése** gomb egy elküldhető csomagot
@@ -92,7 +97,7 @@ python -m pip install -r requirements.txt
 python scripts/pyqt_app.py
 ```
 
-Vagy használd a gyökérkönyvtárban található `AlbionPrizeShower.bat` fájlt.
+Vagy használd a gyökérkönyvtárban található `AlbionMerchantToolkit.bat` fájlt.
 
 Az `items.json` és `localization.json` nagy forrásfájlok, ezért nincsenek a
 Git repositoryban. A futó program alap itemkatalógusát a verziókezelt
@@ -137,7 +142,7 @@ Helyi PyInstaller-build:
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m PyInstaller --noconfirm --clean packaging/AlbionPrizeShower.spec
+python -m PyInstaller --noconfirm --clean packaging/AlbionMerchantToolkit.spec
 ```
 
 ## Fejlesztési állapot
